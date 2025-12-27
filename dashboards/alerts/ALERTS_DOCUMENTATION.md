@@ -1,1302 +1,1767 @@
-# 📊 Documentación de Alertas - AI Calls Dashboard
+# 📊 Documentación Técnica - Sistema de Alertas AI Calls
 
-## 🎯 Quick Reference: Alert Severity Levels
-
-| Alert | Métrica | 🟢 FINE | 🟡 WARNING | 🔴 CRITICAL | ⚪ INSUFFICIENT_DATA |
-|-------|---------|---------|------------|-------------|---------------------|
-| **Alert 1**<br>Hourly Quality | `T_v_LW_ratio`<br>(Today vs Last Week) | `≥ 0.90`<br>(≥90%) | `0.70 - 0.89`<br>(70-89%) | `< 0.70`<br>(<70%) | `< 20 calls` en T o LW |
-| **Alert 2**<br>Daily Quality | `T_v_Y_ratio` **AND**<br>`T_v_30D_ratio` | Una baseline `≥ 0.90` | AMBAS `0.70 - 0.89` | AMBAS `< 0.70` | `< 50 calls` T/Y<br>O `< 20 días` 30D |
-| **Alert 3**<br>Daily Volume | `T_v_LW_ratio` **AND**<br>`T_v_30D_ratio` | Una baseline `≥ 0.90` | AMBAS `0.70 - 0.89` | AMBAS `< 0.70` | `< 3 weekdays`<br>O LW `< 50 calls` |
-| **Alert 4**<br>Short Call Spike | `sigma_deviation`<br>(T vs μ±σ) | `≤ +2σ` | `> +2σ`<br>(con ≥5 short calls) | `> +3σ`<br>O P95*1.2 | `< 10 calls` T<br>O `< 10 hrs` baseline |
-| **Alert 5**<br>Call Duration | `\|sigma_deviation\|`<br>(bidireccional) | `≤ ±2σ` | `> ±2σ` | `> ±3σ` | `< 10 calls` T<br>O `< 10 hrs` baseline |
-
-**Leyenda:**
-- **T:** Today (hoy/hora actual)
-- **Y:** Yesterday (ayer)
-- **LW:** Last Week (semana pasada)
-- **30D:** 30-Day Average (promedio 30 días)
-- **μ:** Media/promedio
-- **σ:** Desviación estándar
-- **AND:** Ambas condiciones deben cumplirse simultáneamente
+> **Versión:** 2.0  
+> **Última actualización:** Diciembre 2025  
+> **Propósito:** Documentación de continuidad del proyecto
 
 ---
 
-## Índice
-1. [Alert 1: Hourly Quality Degradation](#alert-1-hourly-quality-degradation)
-2. [Alert 2: Daily Quality Degradation](#alert-2-daily-quality-degradation)
-3. [Alert 3: Daily Volume Drop](#alert-3-daily-volume-drop)
-4. [Alert 4: Short Call Rate Spike](#alert-4-short-call-rate-spike)
-5. [Alert 5: Call Duration Anomaly](#alert-5-call-duration-anomaly)
-6. [Resumen Comparativo](#-resumen-comparativo-de-las-5-alertas)
-7. [Términos Clave](#-términos-clave)
-8. [Uso de las Alertas](#-uso-de-las-alertas)
+# 1. OVERVIEW
+
+## 1.1 Objetivo del Sistema
+
+El Sistema de Alertas de AI Calls es una plataforma de monitoreo en tiempo real diseñada para detectar anomalías en el comportamiento de las llamadas realizadas por agentes de IA para recuperación de pagos fallidos.
+
+### Problema que Resuelve
+
+Las llamadas de IA operan 24/7 y pueden experimentar degradaciones silenciosas que, sin monitoreo adecuado, pasan desapercibidas hasta que el impacto en el negocio es significativo. Este sistema detecta:
+
+| Tipo de Problema | Impacto en Negocio | Alerta que lo Detecta |
+|------------------|--------------------|-----------------------|
+| Caída en volumen de llamadas | Menor alcance de clientes morosos | Alert 1: Volume Drop |
+| Problemas de conexión | Llamadas no completadas, recursos desperdiciados | Alert 2: Completion Rate Drop |
+| Conversaciones inefectivas | Llamadas que no logran engagement | Alert 3: Quality Rate Drop |
+| Usuarios colgando rápido | Problemas de audio, script o primera impresión | Alert 4: Short Call Rate Spike |
+| Llamadas anormalmente largas/cortas | Bot atrapado en loops o terminando prematuramente | Alert 5: Call Duration Anomaly |
+
+### Principios de Diseño
+
+1. **Reducción de Falsos Positivos:** El sistema usa validación dual (múltiples baselines) y umbrales estadísticos en lugar de umbrales arbitrarios.
+
+2. **Comparaciones "Apples-to-Apples":** Todas las comparaciones temporales se hacen hasta el mismo momento del día (hora:minuto), no contra días completos.
+
+3. **Contexto Estadístico:** Las alertas 4 y 5 usan z-scores (desviaciones estándar) para adaptarse automáticamente a los patrones históricos de cada organización.
+
+4. **Confirmación por Consenso:** Las alertas principales solo se disparan cuando los 3 sub-alerts (DoD, WoW, 30d avg) coinciden en WARNING o CRITICAL.
 
 ---
 
-## Alert 1: Hourly Quality Degradation
+## 1.2 Arquitectura General
 
-### 📋 Descripción General
-Detecta degradación en la calidad de las llamadas comparando la hora actual con la misma hora de la semana pasada. Esta alerta identifica caídas significativas en el ratio de "good calls" vs "completed calls" en ventanas horarias.
+### Flujo de Datos
 
-**Tipo de comparación:** Week-over-Week (WoW) - Hora actual vs misma hora hace 7 días
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              FUENTE DE DATOS                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ai_calls_detail                                                            │
+│  └── Tabla principal con registros individuales de cada llamada             │
+│      └── Refresh: cada 5 minutos                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            CAPA DE QUERIES                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐             │
+│  │     CHARTS      │  │     ALERTS      │  │     METRICS     │             │
+│  │   (Tab 1)       │  │    (Tab 2)      │  │    (Tab 3)      │             │
+│  ├─────────────────┤  ├─────────────────┤  ├─────────────────┤             │
+│  │ • total_calls   │  │ Main Alerts:    │  │ current_summary │             │
+│  │ • completed_    │  │ • alert_1       │  │ • Estado actual │             │
+│  │   calls         │  │ • alert_2       │  │   del día       │             │
+│  │ • total_calls_  │  │ • alert_3       │  │                 │             │
+│  │   all_orgs      │  │ • alert_4       │  │ hourly_summary  │             │
+│  │                 │  │ • alert_5       │  │ • Histórico 7   │             │
+│  │                 │  │                 │  │   días por hora │             │
+│  │                 │  │ Sub-Alerts:     │  │                 │             │
+│  │                 │  │ • *_dod (x5)    │  │                 │             │
+│  │                 │  │ • *_wow (x5)    │  │                 │             │
+│  │                 │  │ • *_30davg (x5) │  │                 │             │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         METABASE DASHBOARD                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                     │
+│  │   Tab 1     │    │   Tab 2     │    │   Tab 3     │                     │
+│  │   Charts    │    │   Alertas   │    │  Métricas   │                     │
+│  └─────────────┘    └─────────────┘    └─────────────┘                     │
+│                            │                                                │
+│                            ▼                                                │
+│                     Slack Integration                                       │
+│                     (CRITICAL/WARNING)                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-**Granularidad:** Horaria
+### Jerarquía de Alertas
 
-**Horario de operación:** 6:00 AM - 11:00 PM (solo genera alertas en este rango)
+```
+ALERTA PRINCIPAL (Main Alert)
+│
+├── Solo se dispara si los 3 sub-alerts coinciden en WARNING o CRITICAL
+│
+├── Sub-Alert X.1: vs DoD (Day over Day)
+│   └── Compara HOY vs AYER (mismo momento)
+│   └── Usa stddev de TODOS los días (últimos 30d)
+│
+├── Sub-Alert X.2: vs WoW (Week over Week)
+│   └── Compara HOY vs HACE 7 DÍAS (mismo momento)
+│   └── Usa stddev del MISMO DÍA DE SEMANA
+│
+└── Sub-Alert X.3: vs 30d Avg
+    └── Compara HOY vs PROMEDIO 30 DÍAS (mismo día de semana, mismo momento)
+    └── Usa stddev del MISMO DÍA DE SEMANA
+```
+
+### ¿Por qué 3 Sub-Alerts?
+
+| Sub-Alert | Baseline | Qué Detecta | Debilidad si se usa solo |
+|-----------|----------|-------------|--------------------------|
+| **DoD** | Ayer | Cambios recientes, problemas de hoy | Sensible a volatilidad diaria |
+| **WoW** | Semana pasada | Patrones semanales, estacionalidad | Ignora tendencias recientes |
+| **30d Avg** | Promedio histórico | Desviaciones del comportamiento normal | Lento para detectar cambios |
+
+**La combinación de los 3** asegura que una alerta solo se dispara cuando hay consenso: el problema es real, no es volatilidad puntual, y representa una desviación significativa del comportamiento histórico.
 
 ---
 
-### 📊 Variables de Salida
+## 1.3 Estructura del Dashboard (3 Tabs)
 
-| Variable | Tipo | Descripción |
+El dashboard en Metabase está organizado en 3 tabs con propósitos distintos:
+
+### Tab 1: Charts (Visualización)
+
+**Propósito:** Proveer contexto visual del comportamiento de llamadas antes de investigar alertas.
+
+| Chart | Query | Descripción |
+|-------|-------|-------------|
+| **Calls por Día/Hora** | `total_calls.sql` | Heatmap que muestra el volumen de llamadas por hora para cada día. Permite identificar patrones temporales y anomalías visuales. |
+| **Completed Calls por Día/Hora** | `completed_calls.sql` | Similar al anterior pero solo para llamadas completadas (excluye failed, voicemail). |
+| **Calls por Organización** | `total_calls_all_orgs.sql` | Vista agregada de todas las organizaciones para comparar volúmenes relativos. |
+
+**Atributos clave de los charts:**
+
+| Atributo | Tipo | Descripción |
 |----------|------|-------------|
-| `datetime` | TIMESTAMP | Marca de tiempo del momento en que se genera la alerta |
-| `T_rate` | FLOAT | **Today Rate** - Ratio de calidad de la hora actual. Calculado como: `good_calls / completed_calls`. Valores entre 0 y 1 (ejemplo: 0.85 = 85% de calidad) |
-| `LW_rate` | FLOAT | **Last Week Rate** - Ratio de calidad de la misma hora hace una semana. Baseline de comparación |
-| `T_v_LW_ratio` | FLOAT | **Today vs Last Week Ratio** - Ratio de comparación entre hoy y semana pasada. Calculado como: `T_rate / LW_rate`. Valores < 1.0 indican degradación (ejemplo: 0.85 = caída del 15%) |
-| `alert_message` | VARCHAR | Mensaje descriptivo de la alerta con detalles de la degradación, métricas actuales y baseline |
-
----
-
-### 🚨 Alert Severity Levels
-
-| Severity | Condición | Umbral | Descripción |
-|----------|-----------|--------|-------------|
-| **🔴 CRITICAL** | `T_v_LW_ratio < 0.70` | Caída > 30% | Calidad actual <70% del baseline de semana pasada. Degradación severa, acción inmediata. |
-| **🟡 WARNING** | `T_v_LW_ratio < 0.90` | Caída 10-30% | Calidad actual 70-90% del baseline. Degradación moderada, requiere monitoreo. |
-| **🟢 FINE** | `T_v_LW_ratio >= 0.90` | Caída < 10% | Calidad actual ≥90% del baseline. Operación normal. |
-| **⚪ INSUFFICIENT_DATA** | `T_calls < 20` OR `LW_calls < 20` | Muestra insuficiente | Datos insuficientes para determinar confiablemente (mínimo 20 completed calls por periodo). |
-
-**Lógica de evaluación:**
-1. Primero verifica si hay suficientes datos (≥20 completed calls en ambos periodos)
-2. Si hay datos suficientes, calcula `T_v_LW_ratio`
-3. Aplica umbrales en orden: CRITICAL (< 0.70) → WARNING (< 0.90) → FINE
-
-**Ejemplo de umbrales:**
-- Si `LW_rate = 0.90` (90%):
-  - CRITICAL: `T_rate < 0.63` (63%)
-  - WARNING: `T_rate < 0.81` (81%)
-  - FINE: `T_rate >= 0.81` (81%+)
-
----
-
-### ⚙️ Cómo Funciona Internamente
-
-#### Paso 1: Extracción de Métricas de la Hora Actual
-```sql
--- Obtiene estadísticas de la hora actual (CURRENT_TIMESTAMP truncada a hora)
-SELECT
-  organization_code,
-  organization_name,
-  country,
-  COUNT(*) AS total_calls,
-  SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
-  SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS good_calls,
-  ROUND(good_calls::float / NULLIF(completed_calls, 0), 4) AS quality_rate
-FROM ai_calls_detail
-WHERE created_hour = date_trunc('hour', CURRENT_TIMESTAMP())
-```
-
-#### Paso 2: Extracción de Métricas de la Semana Pasada (Baseline)
-```sql
--- Obtiene estadísticas de la misma hora hace exactamente 7 días
-WHERE created_hour = date_trunc('hour', CURRENT_TIMESTAMP() - INTERVAL 1 WEEK)
-```
-
-#### Paso 3: Comparación y Determinación de Severidad
-```sql
-CASE
-  -- Insufficient data: Menos de 20 completed calls en hora actual O baseline
-  WHEN completed_calls < 20 OR baseline_completed_calls < 20 
-    THEN 'INSUFFICIENT_DATA'
-  
-  -- CRITICAL: Caída > 30% (quality < 70% del baseline)
-  WHEN T_rate / LW_rate < 0.70
-    THEN 'CRITICAL'
-  
-  -- WARNING: Caída 10-30% (quality 70-90% del baseline)
-  WHEN T_rate / LW_rate < 0.90
-    THEN 'WARNING'
-  
-  ELSE 'FINE'
-END
-```
-
-#### Paso 4: Filtrado de Alertas
-Solo se muestran alertas que cumplan:
-- `alert_severity IN ('CRITICAL', 'WARNING')`
-- `current_hour BETWEEN 6 AND 23` (horario operacional)
-- `current_completed_calls >= 20` (muestra suficiente)
-- `lastweek_completed_calls >= 20` (baseline confiable)
-
----
-
-### 📝 Ejemplo Práctico
-
-**Escenario:** Hoy es Lunes 22 de Diciembre de 2025 a las 5:00 PM
-
-**Datos de entrada:**
-- **Hora actual (Lunes 5:00 PM):**
-  - Total calls: 181
-  - Completed calls: 150
-  - Good calls: 120
-  - Quality rate: 120/150 = **0.80 (80%)**
-
-- **Semana pasada (Lunes 15 Dic 5:00 PM):**
-  - Total calls: 204
-  - Completed calls: 170
-  - Good calls: 160
-  - Quality rate: 160/170 = **0.94 (94%)**
-
-**Cálculos:**
-```
-T_rate = 0.80
-LW_rate = 0.94
-T_v_LW_ratio = 0.80 / 0.94 = 0.851 (85.1%)
-Caída = (1 - 0.851) * 100 = 14.9%
-```
-
-**Resultado:**
-- **Severidad:** `WARNING` (caída del 14.9%, entre 10% y 30%)
-- **Salida:**
-
-| datetime | T_rate | LW_rate | T_v_LW_ratio | alert_message |
-|----------|--------|---------|--------------|---------------|
-| 2025-12-22 17:00:00 | 0.80 | 0.94 | 0.851 | WARNING: Rappi (PE) - Good call quality dropped by 14.9% vs last week same hour. Current: 120/150 (80.0%) |
-
----
-
-## Alert 2: Daily Quality Degradation
-
-### 📋 Descripción General
-Detecta degradación en la calidad de las llamadas usando **DOBLE BASELINE**: compara el día actual (hasta la hora actual) contra ayer Y contra el promedio de los últimos 30 días. Esta alerta usa una validación más estricta para reducir falsos positivos, requiriendo que la degradación se presente en **AMBAS comparaciones**.
-
-**Tipo de comparación:** Dual Baseline
-- **Baseline 1:** Day-over-Day (DoD) - Hoy vs Ayer (hasta misma hora)
-- **Baseline 2:** 30-Day Average - Hoy vs Promedio de TODOS los últimos 30 días (hasta misma hora)
-
-**Granularidad:** Diaria (acumulada hasta hora actual)
-
----
-
-### 📊 Variables de Salida
-
-| Variable | Tipo | Descripción |
-|----------|------|-------------|
-| `datetime` | TIMESTAMP | Marca de tiempo del momento en que se genera la alerta |
-| `T_rate` | FLOAT | **Today Rate** - Ratio de calidad de hoy (hasta hora actual). Calculado como: `good_calls / completed_calls` |
-| `Y_rate` | FLOAT | **Yesterday Rate** - Ratio de calidad de ayer (hasta misma hora que hoy). Primera baseline de comparación |
-| `30D_AVG_rate` | FLOAT | **30-Day Average Rate** - Promedio de quality_rate de TODOS los últimos 30 días (cada día hasta misma hora). Segunda baseline de comparación |
-| `T_v_Y_ratio` | FLOAT | **Today vs Yesterday Ratio** - Ratio de comparación con ayer. Calculado como: `T_rate / Y_rate` |
-| `T_v_30D_ratio` | FLOAT | **Today vs 30-Day Average Ratio** - Ratio de comparación con promedio 30 días. Calculado como: `T_rate / 30D_AVG_rate` |
-| `alert_message` | VARCHAR | Mensaje descriptivo mencionando AMBAS baselines y porcentajes de degradación |
-
----
-
-### 🚨 Alert Severity Levels (DUAL BASELINE)
-
-| Severity | Condición | Umbrales | Descripción |
-|----------|-----------|----------|-------------|
-| **🔴 CRITICAL** | `(T_v_Y_ratio < 0.70)` **AND** `(T_v_30D_ratio < 0.70)` | Caída > 30% en AMBAS | Calidad hoy <70% de ayer Y <70% del promedio 30d. Degradación severa confirmada. |
-| **🟡 WARNING** | `(T_v_Y_ratio < 0.90)` **AND** `(T_v_30D_ratio < 0.90)` | Caída 10-30% en AMBAS | Calidad hoy 70-90% de ambas baselines. Degradación moderada confirmada. |
-| **🟢 FINE** | Otro caso con datos suficientes | Caída < 10% en ≥1 baseline | Calidad aceptable en al menos una baseline. Operación normal o no confirmada. |
-| **⚪ INSUFFICIENT_DATA** | `T_calls < 50` OR `Y_calls < 50` OR `30D_days < 20` | Muestra insuficiente | Datos insuficientes: mínimo 50 calls hoy/ayer, y 20 días en histórico 30d. |
-
-**⚠️ IMPORTANTE - Lógica AND:**
-Esta alerta usa **AMBOS criterios simultáneamente** (operador AND). Solo se dispara si la degradación es evidente en las DOS comparaciones:
-- ❌ Si solo cae vs ayer pero NO vs 30D_AVG → `FINE` (volatilidad normal)
-- ❌ Si solo cae vs 30D_AVG pero NO vs ayer → `FINE` (posible recuperación)
-- ✅ Si cae vs ayer Y también vs 30D_AVG → `WARNING` o `CRITICAL` (degradación real)
-
-**Lógica de evaluación:**
-1. Verifica datos suficientes (≥50 calls hoy/ayer, ≥20 días histórico)
-2. Calcula AMBOS ratios: `T_v_Y_ratio` y `T_v_30D_ratio`
-3. Aplica umbrales con AND lógico:
-   - CRITICAL: `(T_v_Y < 0.70) AND (T_v_30D < 0.70)`
-   - WARNING: `(T_v_Y < 0.90) AND (T_v_30D < 0.90)`
-
-**Ejemplo de umbrales:**
-- Si `Y_rate = 0.90` y `30D_AVG_rate = 0.88`:
-  - CRITICAL: `T_rate < 0.63` (63%) para ayer AND `T_rate < 0.62` (62%) para 30D
-  - WARNING: `T_rate < 0.81` (81%) para ayer AND `T_rate < 0.79` (79%) para 30D
-  - Debe cumplir AMBOS simultáneamente
-
----
-
-### ⚙️ Cómo Funciona Internamente
-
-#### Paso 1: Extracción de Métricas de Hoy (Hasta Hora Actual)
-```sql
-SELECT
-  organization_code,
-  organization_name,
-  country,
-  SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS good_calls,
-  SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
-  ROUND(good_calls::float / NULLIF(completed_calls, 0), 4) AS quality_rate
-FROM ai_calls_detail
-WHERE 
-  created_date = CURRENT_DATE()
-  AND created_at < CURRENT_TIMESTAMP()  -- Solo hasta la hora actual
-```
-
-#### Paso 2: Extracción de Métricas de Ayer (Baseline 1)
-```sql
--- Mismo periodo que hoy pero de ayer
-WHERE 
-  created_date = CURRENT_DATE() - INTERVAL 1 DAY
-  AND created_at < CURRENT_TIMESTAMP() - INTERVAL 1 DAY  -- Hasta misma hora
-```
-
-#### Paso 3: Cálculo de Promedio 30 Días (Baseline 2)
-```sql
--- Para cada uno de los últimos 30 días, calcula quality_rate hasta misma hora
--- Luego promedia todos esos quality_rates
-SELECT
-  organization_code,
-  AVG(daily_quality_rate) AS avg_quality_rate_30d,
-  COUNT(DISTINCT created_date) AS days_with_data
-FROM (
-  SELECT
-    created_date,
-    ROUND(good_calls::float / NULLIF(completed_calls, 0), 4) AS daily_quality_rate
-  FROM ai_calls_detail
-  WHERE 
-    created_date >= CURRENT_DATE() - INTERVAL 30 DAY
-    AND created_date < CURRENT_DATE()
-    -- Solo hasta la misma hora del día (comparación apples-to-apples)
-    AND (
-      EXTRACT(HOUR FROM created_at) < EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
-      OR (
-        EXTRACT(HOUR FROM created_at) = EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
-        AND EXTRACT(MINUTE FROM created_at) <= EXTRACT(MINUTE FROM CURRENT_TIMESTAMP())
-      )
-    )
-  GROUP BY created_date
-  HAVING completed_calls >= 10  -- Mínimo 10 completed calls por día
-)
-```
-
-#### Paso 4: Determinación de Severidad (Requiere AMBOS Criterios)
-```sql
-CASE
-  -- Insufficient data
-  WHEN today_completed_calls < 50 
-    OR yesterday_completed_calls < 50
-    OR baseline_days_count < 20  -- Mínimo 20 días con data
-    THEN 'INSUFFICIENT_DATA'
-  
-  -- CRITICAL: Caída > 30% vs AMBAS baselines (operador AND)
-  WHEN (T_rate / Y_rate < 0.70) AND (T_rate / 30D_AVG_rate < 0.70)
-    THEN 'CRITICAL'
-  
-  -- WARNING: Caída 10-30% vs AMBAS baselines (operador AND)
-  WHEN (T_rate / Y_rate < 0.90) AND (T_rate / 30D_AVG_rate < 0.90)
-    THEN 'WARNING'
-  
-  ELSE 'FINE'
-END
-```
-
-**IMPORTANTE:** La alerta solo se dispara si la degradación es evidente en **AMBAS comparaciones** (AND lógico), no solo en una. Esto reduce significativamente los falsos positivos.
-
-#### Paso 5: Filtrado de Alertas
-Solo se muestran alertas que cumplan:
-- `alert_severity IN ('CRITICAL', 'WARNING')`
-- `today_completed_calls >= 50`
-- `yesterday_completed_calls >= 50`
-- `baseline_days_count >= 20` (suficiente historia)
-
----
-
-### 📝 Ejemplo Práctico
-
-**Escenario:** Hoy es Martes 22 de Diciembre de 2025 a las 3:00 PM
-
-**Datos de entrada:**
-- **Hoy (Martes hasta 3:00 PM):**
-  - Total calls: 450
-  - Completed calls: 380
-  - Good calls: 300
-  - Quality rate: 300/380 = **0.789 (78.9%)**
-
-- **Ayer (Lunes hasta 3:00 PM):**
-  - Completed calls: 400
-  - Good calls: 360
-  - Quality rate: 360/400 = **0.90 (90%)**
-
-- **Promedio 30 días (cada día hasta 3:00 PM):**
-  - Días con data: 28 días
-  - Promedio quality rate: **0.88 (88%)**
-
-**Cálculos:**
-```
-T_rate = 0.789
-Y_rate = 0.90
-30D_AVG_rate = 0.88
-
-T_v_Y_ratio = 0.789 / 0.90 = 0.877 (87.7%)
-Caída vs ayer = (1 - 0.877) * 100 = 12.3%
-
-T_v_30D_ratio = 0.789 / 0.88 = 0.897 (89.7%)
-Caída vs 30d = (1 - 0.897) * 100 = 10.3%
-```
-
-**Evaluación:**
-- `T_v_Y_ratio = 0.877 < 0.90` ✅ (Caída > 10% vs ayer)
-- `T_v_30D_ratio = 0.897 < 0.90` ✅ (Caída > 10% vs 30d avg)
-- **Ambas condiciones cumplen** → `WARNING`
-
-**Resultado:**
-
-| datetime | T_rate | Y_rate | 30D_AVG_rate | T_v_Y_ratio | T_v_30D_ratio | alert_message |
-|----------|--------|--------|--------------|-------------|---------------|---------------|
-| 2025-12-22 15:00:00 | 0.789 | 0.90 | 0.88 | 0.877 | 0.897 | WARNING: Rappi (PE) - Quality dropped by 12.3% vs yesterday AND 10.3% below 30-day avg. Today: 78.9% vs Yesterday: 90.0% |
-
-**Interpretación:** La calidad ha caído tanto respecto a ayer como respecto al promedio histórico, lo que indica una degradación real y no una volatilidad puntual.
-
----
-
-## Alert 3: Daily Volume Drop
-
-### 📋 Descripción General
-Detecta caídas significativas en el volumen de llamadas usando **DOBLE BASELINE**: compara el día actual (hasta la hora actual) contra el mismo día de la semana pasada Y contra el promedio del mismo día de semana de los últimos 30 días. Esta alerta requiere que la caída se presente en **AMBAS comparaciones** para reducir falsos positivos por variabilidad semanal natural.
-
-**Tipo de comparación:** Dual Baseline
-- **Baseline 1:** Week-over-Week (WoW) - Hoy vs Mismo día semana pasada (hasta misma hora)
-- **Baseline 2:** Same-Weekday 30-Day Average - Hoy vs Promedio del mismo día de semana últimos 30 días (hasta misma hora)
-
-**Granularidad:** Diaria (acumulada hasta hora actual)
-
-**Horario de alerta:** Solo se alerta después de las 1:00 PM (para tener suficiente data)
-
----
-
-### 📊 Variables de Salida
-
-| Variable | Tipo | Descripción |
-|----------|------|-------------|
-| `datetime` | TIMESTAMP | Marca de tiempo del momento en que se genera la alerta |
-| `T_Calls` | INTEGER | **Today Calls** - Número total de llamadas hoy (hasta hora actual) |
-| `LW_Calls` | INTEGER | **Last Week Calls** - Número de llamadas del mismo día/hora hace una semana. Primera baseline de comparación |
-| `30D_AVG_Calls` | FLOAT | **30-Day Average Calls** - Promedio de llamadas del mismo día de semana en los últimos 30 días (hasta misma hora). Segunda baseline de comparación. Ejemplo: Si hoy es Lunes, promedia solo los Lunes |
-| `T_v_LW_ratio` | FLOAT | **Today vs Last Week Ratio** - Ratio de comparación con semana pasada. Calculado como: `T_Calls / LW_Calls` |
-| `T_v_30D_ratio` | FLOAT | **Today vs 30-Day Average Ratio** - Ratio de comparación con promedio del mismo día de semana. Calculado como: `T_Calls / 30D_AVG_Calls` |
-| `alert_message` | VARCHAR | Mensaje descriptivo mencionando AMBAS baselines, porcentajes de caída y volúmenes absolutos |
-
----
-
-### 🚨 Alert Severity Levels (DUAL BASELINE)
-
-| Severity | Condición | Umbrales | Descripción |
-|----------|-----------|----------|-------------|
-| **🔴 CRITICAL** | `(T_v_LW_ratio < 0.70)` **AND** `(T_v_30D_ratio < 0.70)` | Caída > 30% en AMBAS | Volumen hoy <70% de semana pasada Y <70% del promedio mismo día de semana. Caída severa confirmada. |
-| **🟡 WARNING** | `(T_v_LW_ratio < 0.90)` **AND** `(T_v_30D_ratio < 0.90)` | Caída 10-30% en AMBAS | Volumen hoy 70-90% de ambas baselines. Caída moderada confirmada. |
-| **🟢 FINE** | Otro caso con datos suficientes | Caída < 10% en ≥1 baseline | Volumen aceptable en al menos una baseline. Operación normal o variabilidad natural. |
-| **⚪ INSUFFICIENT_DATA** | `30D_weekday_count < 3` OR `30D_AVG < 30` OR `LW_calls < 50` | Muestra insuficiente | Datos insuficientes: mínimo 3 días del mismo día de semana en 30d, promedio ≥30 calls/día, y ≥50 calls LW. |
-
-**⚠️ IMPORTANTE - Lógica AND con Mismo Día de Semana:**
-Esta alerta usa **AMBOS criterios simultáneamente** (operador AND) y compara contra el **mismo día de la semana**:
-- Baseline 1: Mismo día hace 7 días (ej: Lunes vs Lunes anterior)
-- Baseline 2: Promedio de **solo** el mismo día de semana en 30 días (ej: promedio de los 4 Lunes)
-
-**Ventaja de filtrar por día de semana:**
-- Evita falsos positivos por patrones semanales (ej: Lunes tiene más volumen que Viernes)
-- Compara "apples-to-apples" (Lunes vs Lunes, Viernes vs Viernes)
-
-**Lógica de evaluación:**
-1. Verifica datos suficientes (≥3 días del mismo día de semana, baseline promedio ≥30, LW ≥50)
-2. Calcula AMBOS ratios: `T_v_LW_ratio` y `T_v_30D_ratio`
-3. Aplica umbrales con AND lógico:
-   - CRITICAL: `(T_v_LW < 0.70) AND (T_v_30D < 0.70)`
-   - WARNING: `(T_v_LW < 0.90) AND (T_v_30D < 0.90)`
-4. Solo alerta después de las **1:00 PM** (para tener suficiente data acumulada del día)
-
-**Ejemplo de umbrales:**
-- Si hoy es Lunes, `LW_Calls = 204` y `30D_AVG_Calls = 218` (promedio de 4 Lunes):
-  - CRITICAL: `T_Calls < 143` (70% de 204) AND `T_Calls < 153` (70% de 218)
-  - WARNING: `T_Calls < 184` (90% de 204) AND `T_Calls < 196` (90% de 218)
-  - Debe cumplir AMBOS simultáneamente
-
----
-
-### ⚙️ Cómo Funciona Internamente
-
-#### Paso 1: Extracción de Volumen de Hoy (Hasta Hora Actual)
-```sql
-SELECT
-  organization_code,
-  organization_name,
-  country,
-  COUNT(*) AS total_calls,
-  SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls
-FROM ai_calls_detail
-WHERE 
-  created_date = CURRENT_DATE()
-  AND created_at < CURRENT_TIMESTAMP()  -- Solo hasta la hora actual
-```
-
-#### Paso 2: Extracción de Volumen de Semana Pasada (Baseline 1)
-```sql
--- Mismo día de la semana hace 7 días, hasta misma hora
-WHERE 
-  created_date = CURRENT_DATE() - INTERVAL 7 DAY
-  AND created_at < CURRENT_TIMESTAMP() - INTERVAL 7 DAY
-```
-
-#### Paso 3: Cálculo de Promedio Mismo Día de Semana 30 Días (Baseline 2)
-```sql
--- Filtra solo días del mismo día de semana (ej: si hoy es Lunes, solo Lunes)
--- Calcula promedio de llamadas acumuladas hasta misma hora
-SELECT
-  organization_code,
-  AVG(daily_calls_until_now) AS avg_daily_calls_30d,
-  COUNT(DISTINCT created_date) AS days_with_data  -- Cuántos Lunes hubo, por ejemplo
-FROM (
-  SELECT
-    created_date,
-    COUNT(*) AS daily_calls_until_now
-  FROM ai_calls_detail
-  WHERE 
-    created_date >= CURRENT_DATE() - INTERVAL 30 DAY
-    AND created_date < CURRENT_DATE()
-    -- FILTRO CLAVE: Solo mismo día de semana
-    AND DAYOFWEEK(created_date) = DAYOFWEEK(CURRENT_DATE())
-    -- Solo hasta misma hora del día (comparación apples-to-apples)
-    AND (
-      EXTRACT(HOUR FROM created_at) < EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
-      OR (
-        EXTRACT(HOUR FROM created_at) = EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
-        AND EXTRACT(MINUTE FROM created_at) <= EXTRACT(MINUTE FROM CURRENT_TIMESTAMP())
-      )
-    )
-  GROUP BY created_date
-)
-```
-
-**Ejemplo:** Si hoy es Lunes 22 de Diciembre a las 5:00 PM, el promedio 30D incluirá:
-- Lunes 15 de Diciembre hasta 5:00 PM
-- Lunes 8 de Diciembre hasta 5:00 PM
-- Lunes 1 de Diciembre hasta 5:00 PM
-- Lunes 24 de Noviembre hasta 5:00 PM
-- (Aproximadamente 4-5 Lunes en ventana de 30 días)
-
-#### Paso 4: Determinación de Severidad (Requiere AMBOS Criterios)
-```sql
-CASE
-  -- Insufficient data
-  WHEN baseline_days_count < 3  -- Mínimo 3 días del mismo día de semana
-    OR baseline_avg_calls < 30
-    OR lastweek_calls < 50
-    THEN 'INSUFFICIENT_DATA'
-  
-  -- CRITICAL: Caída > 30% vs AMBAS baselines (operador AND)
-  WHEN (T_Calls / LW_Calls < 0.70) AND (T_Calls / 30D_AVG_Calls < 0.70)
-    THEN 'CRITICAL'
-  
-  -- WARNING: Caída 10-30% vs AMBAS baselines (operador AND)
-  WHEN (T_Calls / LW_Calls < 0.90) AND (T_Calls / 30D_AVG_Calls < 0.90)
-    THEN 'WARNING'
-  
-  ELSE 'FINE'
-END
-```
-
-#### Paso 5: Filtrado de Alertas
-Solo se muestran alertas que cumplan:
-- `alert_severity IN ('CRITICAL', 'WARNING')`
-- `current_hour >= 13` (después de 1:00 PM para tener datos suficientes)
-- `baseline_days_count >= 3` (mínimo 3 días del mismo día de semana)
-- `lastweek_calls >= 50` (baseline confiable)
-
----
-
-### 📝 Ejemplo Práctico
-
-**Escenario:** Hoy es Lunes 22 de Diciembre de 2025 a las 5:00 PM (como en la imagen)
-
-**Datos de entrada:**
-- **Hoy (Lunes 22 Dic hasta 5:00 PM):**
-  - Total calls: **181**
-  - Completed calls: 150
-
-- **Semana pasada (Lunes 15 Dic hasta 5:00 PM):**
-  - Total calls: **204**
-  - Completed calls: 170
-
-- **Promedio últimos 30 días (solo Lunes hasta 5:00 PM):**
-  - Días con data: 4 Lunes
-  - Promedio: **(200 + 210 + 215 + 220) / 4 = 218 calls**
-
-**Cálculos:**
-```
-T_Calls = 181
-LW_Calls = 204
-30D_AVG_Calls = 218
-
-T_v_LW_ratio = 181 / 204 = 0.887 (88.7%)
-Caída vs semana pasada = (1 - 0.887) * 100 = 11.3%
-
-T_v_30D_ratio = 181 / 218 = 0.830 (83.0%)
-Caída vs 30d avg = (1 - 0.830) * 100 = 17.0%
-```
-
-**Evaluación:**
-- `T_v_LW_ratio = 0.887 < 0.90` ✅ (Caída > 10% vs semana pasada)
-- `T_v_30D_ratio = 0.830 < 0.90` ✅ (Caída > 10% vs 30d avg)
-- **Ambas condiciones cumplen** → `WARNING`
-
-**Resultado (como en la imagen):**
-
-| datetime | T_Calls | LW_Calls | 30D_AVG_Calls | T_v_LW_ratio | T_v_30D_ratio | alert_message |
-|----------|---------|----------|---------------|--------------|---------------|---------------|
-| 2025-12-22 17:00:00 | 181 | 204 | 218 | 0.89 | 0.83 | WARNING: Rappi (PE) - Call volume dropped by 11.3% vs last week AND 17.1% below same-weekday avg (last 30d). Today: 181 calls vs Last Week: 204 calls (Same-Weekday Avg: 218) |
-
-**Interpretación:** El volumen de hoy está bajo tanto comparado con la semana pasada como con el patrón histórico de Lunes, indicando una caída real y no variabilidad normal día-a-día.
-
----
-
-## Alert 4: Short Call Rate Spike
-
-### 📋 Descripción General
-Detecta anomalías en el ratio de llamadas cortas (short calls) usando **detección estadística basada en desviación estándar**. Esta alerta identifica cuando el porcentaje de llamadas cortas está significativamente por encima del promedio histórico, lo que puede indicar problemas técnicos, mala calidad de conexión, o problemas en el flujo conversacional del bot.
-
-**Tipo de comparación:** Detección de Anomalías Estadísticas (Baseline de 30 días con σ - desviación estándar)
-
-**Granularidad:** Horaria (compara hora actual con distribución histórica de la misma hora)
-
-**Método:** Usa estadísticas pre-calculadas de `alerts_baseline_stats` para eficiencia
-
-**Horario de operación:** 6:00 AM - 11:00 PM
-
----
-
-### 📊 Variables de Salida
-
-| Variable | Tipo | Descripción |
-|----------|------|-------------|
-| `datetime` | TIMESTAMP | Marca de tiempo de la hora analizada |
-| `T_rate` | FLOAT | **Today Rate** - Ratio actual de short calls. Calculado como: `short_calls / completed_calls`. Ejemplo: 0.15 = 15% de llamadas son cortas |
-| `30D_AVG_rate` | FLOAT | **30-Day Average Rate** - Promedio histórico del short call rate para la misma hora del día en los últimos 30 días. Baseline de comparación |
-| `sigma_deviation` | FLOAT | **Desviación en Sigmas (σ)** - Número de desviaciones estándar que la tasa actual está por encima del promedio. Calculado como: `(T_rate - 30D_AVG_rate) / stddev_30d`. Ejemplo: 2.5σ significa 2.5 desviaciones estándar por encima de lo normal |
-| `alert_message` | VARCHAR | Mensaje descriptivo con el spike detectado, métricas actuales, baseline y nivel de desviación estadística |
-
----
-
-### 🚨 Alert Severity Levels (DETECCIÓN ESTADÍSTICA)
-
-| Severity | Condición | Umbral Estadístico | Descripción |
-|----------|-----------|-------------------|-------------|
-| **🔴 CRITICAL** | `T_rate > μ + 3σ` OR `(T_rate > P95 * 1.2 AND short_calls ≥ 10)` | > 3σ O > 20% del P95 | Spike extremo: tasa 3 sigma por encima del promedio (probabilidad <0.3%) O supera P95 por >20% con ≥10 short calls. |
-| **🟡 WARNING** | `T_rate > μ + 2σ` AND `short_calls ≥ 5` | > 2σ | Spike significativo: tasa 2 sigma por encima del promedio (fuera del 95% esperado) con ≥5 short calls. |
-| **🟢 FINE** | `T_rate ≤ μ + 2σ` | Dentro de 2σ | Tasa de short calls dentro del rango esperado (95% de valores históricos). Operación normal. |
-| **⚪ INSUFFICIENT_DATA** | `T_calls < 10` OR `baseline_sample_size < 10` | Muestra insuficiente | Datos insuficientes: mínimo 10 completed calls en hora actual y 10 horas en baseline de 30 días. |
-
-**📊 Conceptos Estadísticos:**
-- **μ (mu):** Media/promedio del short call rate histórico
-- **σ (sigma):** Desviación estándar del short call rate histórico
-- **P95:** Percentil 95 (95% de valores históricos están por debajo)
-- **Distribución Normal:**
-  - ~68% de valores caen dentro de μ ± 1σ
-  - ~95% de valores caen dentro de μ ± 2σ
-  - ~99.7% de valores caen dentro de μ ± 3σ
-
-**Lógica de evaluación:**
-1. Verifica datos suficientes (≥10 completed calls, baseline ≥10 horas)
-2. Calcula desviación: `sigma_deviation = (T_rate - μ) / σ`
-3. Aplica umbrales estadísticos:
-   - CRITICAL: `σ_deviation > 3` OR `(T_rate > P95 * 1.2 AND short_calls ≥ 10)`
-   - WARNING: `σ_deviation > 2 AND short_calls ≥ 5`
-4. Solo alerta en horario operacional (6 AM - 11 PM)
-
-**Ejemplo numérico:**
-- Baseline: `μ = 0.12 (12%)`, `σ = 0.04 (4%)`, `P95 = 0.18 (18%)`
-- Umbrales calculados:
-  - WARNING: `T_rate > 0.12 + 2*0.04 = 0.20` (20%) con ≥5 short calls
-  - CRITICAL (opción 1): `T_rate > 0.12 + 3*0.04 = 0.24` (24%)
-  - CRITICAL (opción 2): `T_rate > 0.18 * 1.2 = 0.216` (21.6%) con ≥10 short calls
-- Si `T_rate = 0.22 (22%)` y `short_calls = 8`:
-  - `σ_deviation = (0.22 - 0.12) / 0.04 = 2.5σ`
-  - Resultado: **WARNING** (>2σ pero <3σ, con suficientes short calls)
-
----
-
-### ⚙️ Cómo Funciona Internamente
-
-#### Paso 1: Extracción de Métricas de la Hora Actual
-```sql
-SELECT
-  organization_code,
-  organization_name,
-  country,
-  created_hour,
-  COUNT(*) AS total_calls,
-  SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
-  SUM(CASE WHEN call_classification = 'short_calls' THEN 1 ELSE 0 END) AS short_calls,
-  ROUND(short_calls::float / NULLIF(completed_calls, 0), 4) AS short_call_rate
-FROM ai_calls_detail
-WHERE created_hour = date_trunc('hour', CURRENT_TIMESTAMP())
-```
-
-#### Paso 2: Obtención de Estadísticas Baseline (Pre-calculadas)
-
-**¿Qué es `alerts_baseline_stats`?**
-
-`alerts_baseline_stats` es una **Materialized View** (vista materializada) dbt que pre-calcula estadísticas históricas rolling de los últimos 7 y 30 días. Esta tabla optimiza las alertas 4 y 5 al evitar cálculos costosos en tiempo real.
-
-**¿Por qué se usa?**
-
-En lugar de calcular desviaciones estándar, percentiles y promedios cada vez que se ejecuta una alerta (lo cual sería muy lento), estas estadísticas se pre-calculan y se actualizan **cada 1 hora** automáticamente. Esto permite:
-- ⚡ **Consultas ultra-rápidas:** Las alertas solo hacen un `JOIN` simple
-- 📊 **Estadísticas complejas:** Cálculos de σ, percentiles (P25, P50, P75, P95)
-- 🎯 **Granularidad por hora del día:** Compara hora actual con patrón histórico de la misma hora
-- 🔄 **Actualización automática:** StarRocks refresca la vista cada hora
-
-**¿Cómo se calcula?**
-
-La vista materializada sigue este proceso:
-
-1. **Agregación horaria (últimos 30 días):**
-   ```sql
-   -- Desde ai_calls_detail, agrupa por hora
-   SELECT
-     organization_code, country, hour_of_day, created_hour,
-     COUNT(*) AS completed_calls,
-     ROUND(short_calls / completed_calls, 4) AS short_call_rate,
-     ROUND(AVG(call_duration_seconds), 2) AS avg_call_duration_seconds
-   FROM ai_calls_detail
-   WHERE created_date >= CURRENT_DATE() - INTERVAL 30 DAY
-   GROUP BY organization_code, country, hour_of_day, created_hour
-   HAVING completed_calls >= 10  -- Solo horas con volumen suficiente
-   ```
-
-2. **Cálculo de estadísticas por hora del día (30 días):**
-   ```sql
-   -- Para cada combinación de org, país, hora_del_día
-   SELECT
-     organization_code, country, hour_of_day,
-     
-     -- Alert 4: Short Call Rate
-     AVG(short_call_rate) AS avg_short_call_rate_30d,           -- μ (media)
-     STDDEV(short_call_rate) AS stddev_short_call_rate_30d,     -- σ (desv. estándar)
-     percentile_approx(short_call_rate, 0.50) AS p50_...,       -- Mediana
-     percentile_approx(short_call_rate, 0.95) AS p95_...,       -- Percentil 95
-     
-     -- Alert 5: Call Duration
-     AVG(avg_call_duration_seconds) AS avg_call_duration_30d,   -- μ (media)
-     STDDEV(avg_call_duration_seconds) AS stddev_..._30d,       -- σ (desv. estándar)
-     percentile_approx(avg_call_duration_seconds, 0.05) AS p05, -- Percentil 5
-     percentile_approx(avg_call_duration_seconds, 0.95) AS p95, -- Percentil 95
-     
-     COUNT(*) AS sample_size_30d                                 -- # horas con datos
-   FROM recent_data
-   GROUP BY organization_code, country, hour_of_day
-   ```
-
-3. **Pre-cálculo de umbrales:**
-   ```sql
-   -- Umbrales de alerta ya calculados
-   avg_short_call_rate_30d + 2 * stddev_30d AS short_call_rate_upper_threshold,
-   avg_call_duration_30d - 2 * stddev_30d AS call_duration_lower_threshold,
-   avg_call_duration_30d + 2 * stddev_30d AS call_duration_upper_threshold
-   ```
-
-**Ejemplo de datos en `alerts_baseline_stats`:**
-
-| organization_code | country | hour_of_day | avg_short_call_rate_30d | stddev_short_call_rate_30d | p95_short_call_rate_30d | sample_size_30d |
-|-------------------|---------|-------------|-------------------------|----------------------------|-------------------------|-----------------|
-| rappi_pe | PE | 16 | 0.1200 | 0.0400 | 0.1800 | 28 |
-| rappi_pe | PE | 17 | 0.1150 | 0.0380 | 0.1750 | 29 |
-
-**Join con métricas actuales:**
-
-```sql
--- Las alertas hacen un JOIN simple y rápido
-FROM current_hour_metrics curr
-INNER JOIN alerts_baseline_stats base
-  ON curr.organization_code = base.organization_code
-  AND curr.country = base.country
-  AND EXTRACT(HOUR FROM curr.created_hour) = base.hour_of_day  -- Misma hora del día
-
--- Estadísticas disponibles inmediatamente:
--- - avg_short_call_rate_30d: Promedio del short call rate (μ)
--- - stddev_short_call_rate_30d: Desviación estándar (σ)
--- - p50_short_call_rate_30d: Mediana (percentil 50)
--- - p95_short_call_rate_30d: Percentil 95
--- - sample_size_30d: Número de horas con datos en últimos 30 días
-```
-
-**Ventajas de este enfoque:**
-- ✅ **Compara "apples-to-apples":** Lunes 4 PM vs promedio histórico de Lunes 4 PM
-- ✅ **Considera patrones horarios:** Diferentes horas tienen diferentes comportamientos
-- ✅ **Eficiente:** Pre-cálculo evita computación pesada en tiempo real
-- ✅ **Confiable:** `sample_size_30d` indica cuántas horas históricas se usaron
-
-#### Paso 3: Cálculo de Desviación Estadística
-```sql
--- Calcula cuántas desviaciones estándar está el valor actual del promedio
-sigma_deviation = (current_short_call_rate - avg_short_call_rate_30d) / stddev_short_call_rate_30d
-
--- Ejemplo:
--- Si avg = 0.10 (10%), stddev = 0.03, y current = 0.16 (16%)
--- sigma_deviation = (0.16 - 0.10) / 0.03 = 2.0σ
-```
-
-#### Paso 4: Determinación de Severidad
-```sql
-CASE
-  -- Insufficient data
-  WHEN completed_calls < 10 
-    OR sample_size_30d < 10
-    THEN 'INSUFFICIENT_DATA'
-  
-  -- CRITICAL: > 3 desviaciones estándar O > percentil 95 por gran margen
-  WHEN current_rate > avg_30d + 3 * stddev_30d
-    OR (current_rate > p95_30d * 1.2 AND short_calls >= 10)
-    THEN 'CRITICAL'
-  
-  -- WARNING: > 2 desviaciones estándar
-  WHEN current_rate > avg_30d + 2 * stddev_30d
-    AND short_calls >= 5
-    THEN 'WARNING'
-  
-  ELSE 'FINE'
-END
-```
-
-**Nota sobre cambios de umbral:**
-- Se redujo de `< 20` a `< 10` completed calls para INSUFFICIENT_DATA
-- Se eliminó la verificación `has_sufficient_baseline_data = FALSE` 
-- Esto hace la alerta menos restrictiva, permitiendo detección temprana con muestras más pequeñas
-
-**Umbrales Estadísticos:**
-- **WARNING:** `T_rate > μ + 2σ` (valor actual > promedio + 2 desviaciones estándar)
-  - En distribución normal, ~95% de valores caen dentro de 2σ
-- **CRITICAL:** `T_rate > μ + 3σ` (valor actual > promedio + 3 desviaciones estándar)
-  - En distribución normal, ~99.7% de valores caen dentro de 3σ
-  - Valores >3σ son extremadamente raros (0.3% probabilidad)
-
-#### Paso 5: Filtrado de Alertas
-Solo se muestran alertas que cumplan:
-- `alert_severity IN ('CRITICAL', 'WARNING')`
-- `current_hour BETWEEN 6 AND 23`
-- `current_completed_calls >= 10`
-
----
-
-### 📝 Ejemplo Práctico
-
-**Escenario:** Hoy es Miércoles 22 de Diciembre de 2025 a las 4:00 PM
-
-**Datos de entrada:**
-
-**Hora actual (Miércoles 4:00 PM):**
-- Total calls: 220
-- Completed calls: 180
-- Short calls: 40
-- Short call rate: 40/180 = **0.222 (22.2%)**
-
-**Baseline (últimos 30 días, horas de 4:00 PM):**
-- Promedio (μ): **0.12 (12%)**
-- Desviación estándar (σ): **0.04 (4%)**
-- Mediana: 0.11
-- Percentil 95: 0.18
-- Sample size: 28 horas
-
-**Cálculos:**
-```
-T_rate = 0.222 (22.2%)
-30D_AVG_rate = 0.12 (12%)
-stddev = 0.04
-
-sigma_deviation = (0.222 - 0.12) / 0.04 = 2.55σ
-
-Umbral WARNING: 0.12 + 2*0.04 = 0.20 (20%)
-Umbral CRITICAL: 0.12 + 3*0.04 = 0.24 (24%)
-```
-
-**Evaluación:**
-- `T_rate = 0.222 > 0.20 (umbral WARNING)` ✅
-- `T_rate = 0.222 < 0.24 (umbral CRITICAL)` ✅
-- `sigma_deviation = 2.55σ > 2σ` ✅
-- **Resultado:** `WARNING`
-
-**Resultado:**
-
-| datetime | T_rate | 30D_AVG_rate | sigma_deviation | alert_message |
-|----------|--------|--------------|-----------------|---------------|
-| 2025-12-22 16:00:00 | 0.222 | 0.12 | 2.55 | WARNING: Rappi (PE) - Elevated short call rate. Current: 22.2% vs Baseline: 12.0% (+2.55σ) |
-
-**Interpretación:** El porcentaje de llamadas cortas está 2.55 desviaciones estándar por encima del promedio histórico. Esto indica una anomalía estadísticamente significativa que merece investigación (posibles causas: problemas de red, cambios en el bot, problemas con proveedores de telefonía).
-
----
-
-## Alert 5: Call Duration Anomaly
-
-### 📋 Descripción General
-Detecta anomalías en la duración promedio de las llamadas usando **detección estadística bidireccional**. Esta alerta identifica cuando la duración de las llamadas está significativamente fuera del rango normal, tanto si es **demasiado corta** como **demasiado larga**, lo que puede indicar diferentes tipos de problemas operacionales o técnicos.
-
-**Tipo de comparación:** Detección de Anomalías Estadísticas Bidireccional (Baseline de 30 días con μ ± 2σ)
-
-**Granularidad:** Horaria (tiempo real, compara hora actual con distribución histórica)
-
-**Método:** Usa estadísticas pre-calculadas de `alerts_baseline_stats` para eficiencia
-
-**Tipos de anomalía:**
-- **TOO_SHORT:** Duración anormalmente corta (posible problema de calidad, desconexiones)
-- **TOO_LONG:** Duración anormalmente larga (posible problema de bot, loops, o casos edge)
-
-**Horario de operación:** 6:00 AM - 11:00 PM
-
----
-
-### 📊 Variables de Salida
-
-| Variable | Tipo | Descripción |
-|----------|------|-------------|
-| `datetime` | TIMESTAMP | Marca de tiempo del momento en que se genera la alerta |
-| `T_avg_duration_seconds` | FLOAT | **Today Average Duration** - Duración promedio actual de las llamadas en segundos |
-| `30D_AVG_duration_seconds` | FLOAT | **30-Day Average Duration** - Duración promedio histórica para la misma hora del día en los últimos 30 días. Baseline de comparación (μ) |
-| `sigma_deviation` | FLOAT | **Desviación en Sigmas (σ)** - Número de desviaciones estándar que la duración actual difiere del promedio. Puede ser positivo (más larga) o negativo (más corta). Calculado como: `(T_avg - 30D_AVG) / stddev_30d` |
-| `alert_message` | VARCHAR | Mensaje descriptivo indicando tipo de anomalía (TOO_SHORT/TOO_LONG), duración actual vs baseline, y nivel de desviación estadística |
-
----
-
-### 🚨 Alert Severity Levels (DETECCIÓN ESTADÍSTICA BIDIRECCIONAL)
-
-| Severity | Condición | Umbral Estadístico | Descripción |
-|----------|-----------|-------------------|-------------|
-| **🔴 CRITICAL** | `\|T_avg - μ\| > 3σ` | Desviación > 3σ (cualquier dirección) | Anomalía extrema: duración promedio >3 desviaciones estándar del histórico (probabilidad <0.3%). Ya sea demasiado corta o larga. |
-| **🟡 WARNING** | `\|T_avg - μ\| > 2σ` | Desviación > 2σ (cualquier dirección) | Anomalía significativa: duración >2 desviaciones estándar del promedio (fuera del 95% esperado). |
-| **🟢 FINE** | `\|T_avg - μ\| ≤ 2σ` | Dentro de ±2σ | Duración dentro del rango esperado (95% de valores históricos). Operación normal. |
-| **⚪ INSUFFICIENT_DATA** | `T_calls < 10` OR `baseline_sample_size < 10` | Muestra insuficiente | Datos insuficientes: mínimo 10 completed calls en hora actual y 10 horas en baseline de 30 días. |
-
-**🔄 Tipos de Anomalía:**
-
-| Tipo | Condición | Interpretación | Posibles Causas |
-|------|-----------|----------------|-----------------|
-| **TOO_SHORT** | `T_avg < μ - 2σ` | Llamadas anormalmente cortas | - Problemas de calidad de red<br>- Desconexiones frecuentes<br>- Usuarios colgando prematuramente<br>- Problemas en el flujo del bot |
-| **TOO_LONG** | `T_avg > μ + 2σ` | Llamadas anormalmente largas | - Loops en el bot<br>- Casos edge no manejados<br>- Problemas en lógica de finalización<br>- Consultas inusualmente complejas |
-| **NORMAL** | `μ - 2σ ≤ T_avg ≤ μ + 2σ` | Duración dentro de lo esperado | Operación normal |
-
-**📊 Conceptos Estadísticos:**
-- **μ (mu):** Media/promedio de la duración histórica (en segundos)
-- **σ (sigma):** Desviación estándar de la duración histórica
-- **Lower Threshold:** `μ - 2σ` (límite inferior de lo aceptable)
-- **Upper Threshold:** `μ + 2σ` (límite superior de lo aceptable)
-- **|x|:** Valor absoluto (distancia sin importar dirección)
-
-**Lógica de evaluación:**
-1. Verifica datos suficientes (≥10 completed calls, baseline ≥10 horas)
-2. Calcula desviación: `sigma_deviation = (T_avg - μ) / σ`
-   - Si negativo: llamadas más cortas de lo normal
-   - Si positivo: llamadas más largas de lo normal
-3. Calcula valor absoluto: `|sigma_deviation|`
-4. Clasifica tipo de anomalía:
-   - Si `T_avg < μ - 2σ` → `TOO_SHORT`
-   - Si `T_avg > μ + 2σ` → `TOO_LONG`
-   - Sino → `NORMAL`
-5. Aplica umbrales de severidad:
-   - CRITICAL: `|σ_deviation| > 3`
-   - WARNING: `|σ_deviation| > 2`
-6. Solo alerta en horario operacional (6 AM - 11 PM)
-
-**Ejemplo numérico (TOO_SHORT):**
-- Baseline: `μ = 180s`, `σ = 35s`
-- Umbrales:
-  - Lower: `180 - 2*35 = 110s`
-  - Upper: `180 + 2*35 = 250s`
-  - CRITICAL: `|σ| > 3` → `T_avg < 75s` o `T_avg > 285s`
-  - WARNING: `|σ| > 2` → `T_avg < 110s` o `T_avg > 250s`
-- Si `T_avg = 86.7s`:
-  - `σ_deviation = (86.7 - 180) / 35 = -2.67σ`
-  - `|σ_deviation| = 2.67 > 2` pero `< 3`
-  - Tipo: `TOO_SHORT` (86.7 < 110)
-  - Resultado: **WARNING**
-
-**Ejemplo numérico (TOO_LONG):**
-- Mismo baseline: `μ = 170s`, `σ = 28s`
-- Si `T_avg = 260s`:
-  - `σ_deviation = (260 - 170) / 28 = +3.21σ`
-  - `|σ_deviation| = 3.21 > 3`
-  - Tipo: `TOO_LONG` (260 > 226)
-  - Resultado: **CRITICAL**
-
----
-
-### ⚙️ Cómo Funciona Internamente
-
-#### Paso 1: Extracción de Métricas de la Hora Actual (Tiempo Real)
-```sql
-SELECT
-  organization_code,
-  organization_name,
-  country,
-  COUNT(*) AS total_calls,
-  SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
-  ROUND(AVG(call_duration_seconds), 2) AS avg_call_duration_seconds
-FROM ai_calls_detail
-WHERE created_hour = date_trunc('hour', CURRENT_TIMESTAMP())
-```
-
-#### Paso 2: Obtención de Estadísticas Baseline (Pre-calculadas)
-
-**Uso de `alerts_baseline_stats` para Alert 5**
-
-Esta alerta también utiliza la vista materializada `alerts_baseline_stats`, pero en este caso aprovecha las **estadísticas de duración de llamadas** pre-calculadas. A diferencia de Alert 4 (que solo detecta spikes hacia arriba), Alert 5 es **bidireccional** y necesita umbrales superior E inferior.
-
-**¿Qué estadísticas se usan?**
-
-```sql
--- Join con tabla de estadísticas baseline (actualizada cada 1 hora)
-FROM current_hour_realtime curr
-INNER JOIN alerts_baseline_stats base
-  ON curr.organization_code = base.organization_code
-  AND curr.country = base.country
-  AND EXTRACT(HOUR FROM CURRENT_TIMESTAMP()) = base.hour_of_day
-
--- Estadísticas pre-calculadas para call duration:
--- - avg_call_duration_30d: Promedio histórico de duración (μ) en segundos
--- - stddev_call_duration_30d: Desviación estándar (σ) en segundos
--- - p05_call_duration_30d: Percentil 5 (5% de duraciones más cortas)
--- - p25_call_duration_30d: Percentil 25 (cuartil inferior)
--- - p50_call_duration_30d: Mediana (percentil 50)
--- - p75_call_duration_30d: Percentil 75 (cuartil superior)
--- - p95_call_duration_30d: Percentil 95 (5% de duraciones más largas)
--- - call_duration_lower_threshold: μ - 2σ (límite inferior para TOO_SHORT)
--- - call_duration_upper_threshold: μ + 2σ (límite superior para TOO_LONG)
--- - sample_size_30d: Número de horas con datos en últimos 30 días
-```
-
-**Cálculo específico para duración:**
-
-La tabla `alerts_baseline_stats` calcula estas estadísticas así:
-
-```sql
--- 1. Primero obtiene duración promedio POR HORA desde ai_calls_detail
-SELECT
-  organization_code, country, hour_of_day, created_hour,
-  ROUND(AVG(call_duration_seconds), 2) AS avg_call_duration_seconds
-FROM ai_calls_detail
-WHERE created_date >= CURRENT_DATE() - INTERVAL 30 DAY
-GROUP BY organization_code, country, hour_of_day, created_hour
-HAVING completed_calls >= 10
-
--- 2. Luego calcula estadísticas sobre esos promedios horarios
-SELECT
-  organization_code, country, hour_of_day,
-  AVG(avg_call_duration_seconds) AS avg_call_duration_30d,        -- μ
-  STDDEV(avg_call_duration_seconds) AS stddev_call_duration_30d,  -- σ
-  percentile_approx(avg_call_duration_seconds, 0.05) AS p05,      -- 5%
-  percentile_approx(avg_call_duration_seconds, 0.95) AS p95,      -- 95%
-  
-  -- Pre-calcula umbrales bidireccionales
-  AVG(...) - 2 * STDDEV(...) AS call_duration_lower_threshold,  -- μ - 2σ
-  AVG(...) + 2 * STDDEV(...) AS call_duration_upper_threshold,  -- μ + 2σ
-  
-  COUNT(*) AS sample_size_30d
-FROM ...
-GROUP BY organization_code, country, hour_of_day
-```
-
-**Ejemplo de datos para Rappi PE a las 4 PM:**
-
-| Estadística | Valor | Interpretación |
-|-------------|-------|----------------|
-| `avg_call_duration_30d` | 180s | Promedio histórico: 3 minutos |
-| `stddev_call_duration_30d` | 35s | Desviación estándar típica |
-| `p05_call_duration_30d` | 120s | 5% de llamadas duran menos de 2 min |
-| `p50_call_duration_30d` | 175s | Mediana: 2.9 minutos |
-| `p95_call_duration_30d` | 240s | 5% de llamadas duran más de 4 min |
-| `call_duration_lower_threshold` | 110s | μ - 2σ: Umbral TOO_SHORT |
-| `call_duration_upper_threshold` | 250s | μ + 2σ: Umbral TOO_LONG |
-| `sample_size_30d` | 28 | 28 horas de 4 PM en últimos 30 días |
-
-**Ventajas para detección bidireccional:**
-- ✅ **Umbrales pre-calculados:** No necesita calcular `μ - 2σ` y `μ + 2σ` en cada ejecución
-- ✅ **Rango completo de percentiles:** Permite análisis detallado de distribución
-- ✅ **Detecta ambos extremos:** TOO_SHORT (< μ - 2σ) y TOO_LONG (> μ + 2σ)
-- ✅ **Considera variabilidad horaria:** La duración típica varía según hora del día
-
-#### Paso 3: Cálculo de Desviación Estadística
-```sql
--- Calcula cuántas desviaciones estándar está el valor actual del promedio
-sigma_deviation = (current_avg_duration - avg_duration_30d) / stddev_duration_30d
-
--- Ejemplo 1 (TOO_SHORT):
--- Si avg = 180s, stddev = 30s, y current = 120s
--- sigma_deviation = (120 - 180) / 30 = -2.0σ (negativo = más corto)
-
--- Ejemplo 2 (TOO_LONG):
--- Si avg = 180s, stddev = 30s, y current = 250s
--- sigma_deviation = (250 - 180) / 30 = +2.33σ (positivo = más largo)
-```
-
-#### Paso 4: Clasificación de Tipo de Anomalía
-```sql
-CASE 
-  WHEN current_avg_duration < call_duration_lower_threshold  -- μ - 2σ
-    THEN 'TOO_SHORT'
-  WHEN current_avg_duration > call_duration_upper_threshold  -- μ + 2σ
-    THEN 'TOO_LONG'
-  ELSE 'NORMAL'
-END AS anomaly_type
-```
-
-#### Paso 5: Determinación de Severidad
-```sql
-CASE
-  -- Insufficient data
-  WHEN completed_calls < 10 
-    OR sample_size_30d < 10
-    THEN 'INSUFFICIENT_DATA'
-  
-  -- CRITICAL: > 3 desviaciones estándar (en cualquier dirección)
-  WHEN ABS(current_avg_duration - avg_duration_30d) > 3 * stddev_30d
-    THEN 'CRITICAL'
-  
-  -- WARNING: > 2 desviaciones estándar (en cualquier dirección)
-  WHEN ABS(current_avg_duration - avg_duration_30d) > 2 * stddev_30d
-    THEN 'WARNING'
-  
-  ELSE 'FINE'
-END
-```
-
-**Nota sobre cambios de umbral:**
-- Se redujo de `< 20` a `< 10` completed calls para INSUFFICIENT_DATA
-- Se eliminó la verificación `has_sufficient_baseline_data = FALSE`
-- Esto hace la alerta menos restrictiva, permitiendo detección temprana de anomalías con muestras más pequeñas
-
-**Umbrales Estadísticos (Bidireccionales):**
-- **Rango Normal:** `μ ± 2σ` (95% de valores esperados)
-- **WARNING:** `|current - μ| > 2σ`
-- **CRITICAL:** `|current - μ| > 3σ`
-
-#### Paso 6: Filtrado de Alertas
-Solo se muestran alertas que cumplan:
-- `alert_severity IN ('CRITICAL', 'WARNING')`
-- `current_hour BETWEEN 6 AND 23`
-- `current_completed_calls >= 10`
-
----
-
-### 📝 Ejemplo Práctico 1: Duración Anormalmente Corta
-
-**Escenario:** Hoy es Jueves 22 de Diciembre de 2025 a las 10:00 AM
-
-**Datos de entrada:**
-
-**Hora actual (Jueves 10:00 AM):**
-- Total calls: 150
-- Completed calls: 130
-- Total call seconds: 13,000
-- Average duration: 13,000/150 = **86.7 segundos** (~1.4 minutos)
-
-**Baseline (últimos 30 días, horas de 10:00 AM):**
-- Promedio (μ): **180 segundos** (3 minutos)
-- Desviación estándar (σ): **35 segundos**
-- Mediana: 175s
-- P25: 150s
-- P75: 210s
-- Lower threshold (μ - 2σ): 180 - 2*35 = **110 segundos**
-- Upper threshold (μ + 2σ): 180 + 2*35 = **250 segundos**
-- Sample size: 27 horas
-
-**Cálculos:**
-```
-T_avg_duration_seconds = 86.7s
-30D_AVG_duration_seconds = 180s
-stddev = 35s
-
-sigma_deviation = (86.7 - 180) / 35 = -2.67σ (negativo = más corto)
-
-Lower threshold = 110s
-```
-
-**Evaluación:**
-- `T_avg_duration = 86.7s < 110s (lower threshold)` ✅ → Anomalía TOO_SHORT
-- `|sigma_deviation| = 2.67 > 2σ` ✅ → WARNING
-- `|sigma_deviation| = 2.67 < 3σ` ✅ → No es CRITICAL
-
-**Resultado:**
-
-| datetime | T_avg_duration_seconds | 30D_AVG_duration_seconds | sigma_deviation | alert_message |
-|----------|------------------------|--------------------------|-----------------|---------------|
-| 2025-12-22 10:00:00 | 86.7 | 180 | -2.67 | WARNING: Rappi (PE) - Shorter than usual call duration. Current: 87s vs Baseline: 180s |
-
-**Interpretación:** Las llamadas están durando significativamente menos de lo normal (2.67 desviaciones estándar por debajo del promedio). Posibles causas: problemas de calidad de red, usuarios colgando antes de tiempo, problemas en el flujo conversacional del bot que causan frustración temprana.
-
----
-
-### 📝 Ejemplo Práctico 2: Duración Anormalmente Larga
-
-**Escenario:** Hoy es Viernes 22 de Diciembre de 2025 a las 2:00 PM
-
-**Datos de entrada:**
-
-**Hora actual (Viernes 2:00 PM):**
-- Total calls: 200
-- Completed calls: 170
-- Total call seconds: 52,000
-- Average duration: 52,000/200 = **260 segundos** (~4.3 minutos)
-
-**Baseline (últimos 30 días, horas de 2:00 PM):**
-- Promedio (μ): **170 segundos** (~2.8 minutos)
-- Desviación estándar (σ): **28 segundos**
-- Upper threshold (μ + 2σ): 170 + 2*28 = **226 segundos**
-- Sample size: 29 horas
-
-**Cálculos:**
-```
-T_avg_duration_seconds = 260s
-30D_AVG_duration_seconds = 170s
-stddev = 28s
-
-sigma_deviation = (260 - 170) / 28 = +3.21σ (positivo = más largo)
-
-Upper threshold = 226s
-```
-
-**Evaluación:**
-- `T_avg_duration = 260s > 226s (upper threshold)` ✅ → Anomalía TOO_LONG
-- `sigma_deviation = 3.21 > 3σ` ✅ → CRITICAL
-
-**Resultado:**
-
-| datetime | T_avg_duration_seconds | 30D_AVG_duration_seconds | sigma_deviation | alert_message |
-|----------|------------------------|--------------------------|-----------------|---------------|
-| 2025-12-22 14:00:00 | 260 | 170 | +3.21 | CRITICAL: Rappi (PE) - Call duration ANOMALY: Unusually LONG! Current avg: 260s vs Baseline: 170s (+3.21σ above normal) |
-
-**Interpretación:** Las llamadas están durando significativamente más de lo normal (3.21 desviaciones estándar por encima del promedio). Posibles causas: problemas en el bot que causan loops, casos edge no manejados correctamente, alta complejidad de consultas de usuarios, o problemas en la lógica de finalización de llamadas.
-
----
-
-## 📌 Resumen Comparativo de las 5 Alertas
-
-| Alert | Tipo de Comparación | Granularidad | Baselines | Método Detección | Umbrales Severidad | Horario Alerta |
-|-------|-------------------|--------------|-----------|------------------|-------------------|----------------|
-| **Alert 1** | Week-over-Week (WoW) | Horaria | 1 baseline (semana pasada misma hora) | Threshold fijo | 🟡 WARNING: `< 90%`<br>🔴 CRITICAL: `< 70%` | 6 AM - 11 PM |
-| **Alert 2** | Dual Baseline (DoD + 30D) | Diaria | 2 baselines (ayer + promedio 30d todos los días) | Threshold fijo AND lógico | 🟡 WARNING: `< 90%` en AMBAS<br>🔴 CRITICAL: `< 70%` en AMBAS | Todo el día |
-| **Alert 3** | Dual Baseline (WoW + 30D) | Diaria | 2 baselines (semana pasada + promedio 30d mismo día semana) | Threshold fijo AND lógico | 🟡 WARNING: `< 90%` en AMBAS<br>🔴 CRITICAL: `< 70%` en AMBAS | Después de 1 PM |
-| **Alert 4** | Detección Estadística | Horaria | 1 baseline (30d mismo hora) con σ | Desviación estándar | 🟡 WARNING: `> μ + 2σ`<br>🔴 CRITICAL: `> μ + 3σ` o `> P95*1.2` | 6 AM - 11 PM |
-| **Alert 5** | Detección Estadística Bidireccional | Horaria (tiempo real) | 1 baseline (30d misma hora) con σ | Desviación estándar bidireccional | 🟡 WARNING: `\|x - μ\| > 2σ`<br>🔴 CRITICAL: `\|x - μ\| > 3σ` | 6 AM - 11 PM |
-
-**Notas importantes:**
-- **Alert 2 y 3:** Usan operador AND - deben cumplirse AMBAS condiciones simultáneamente
-- **Alert 4:** Solo detecta spikes (aumentos), no caídas
-- **Alert 5:** Bidireccional - detecta tanto duraciones TOO_SHORT como TOO_LONG
-- **Todas:** Requieren muestra mínima de datos (varía por alerta), sino reportan INSUFFICIENT_DATA
-
----
-
-## 🔍 Términos Clave
-
-### Métricas de Clasificación de Llamadas
-- **good_calls:** Llamadas completadas de alta calidad (duración > umbral de llamada corta)
-- **short_calls:** Llamadas completadas pero con duración muy corta (posible mala calidad)
-- **completed_calls:** Total de llamadas completadas (`good_calls + short_calls`)
-- **quality_rate:** Ratio de good_calls respecto a completed_calls (`good_calls / completed_calls`)
-
-### Notación de Periodos Temporales
-- **T (Today):** Métrica del periodo actual (hoy o hora actual)
-- **Y (Yesterday):** Métrica de ayer mismo momento
-- **LW (Last Week):** Métrica de la semana pasada mismo día/hora
-- **30D_AVG (30-Day Average):** Promedio de los últimos 30 días
-- **30D (30-Day):** Relativo a los últimos 30 días
-
-### Conceptos Estadísticos
-- **μ (mu):** Media o promedio
-- **σ (sigma):** Desviación estándar
-- **Pxx (Percentil):** Valor por debajo del cual cae el xx% de los datos
-  - P50: Mediana (50% de datos están por debajo)
-  - P95: 95% de datos están por debajo
-- **Threshold:** Umbral calculado (ej: μ ± 2σ)
-- **Sigma deviation:** Número de desviaciones estándar de distancia del promedio
-
-### Niveles de Severidad
-
-Los niveles de severidad son estándares para todas las alertas, pero los umbrales específicos varían según el tipo de detección:
-
-| Severity | Símbolo | Descripción General | Acción Recomendada |
-|----------|---------|---------------------|-------------------|
-| **🔴 CRITICAL** | CRITICAL | Degradación severa o anomalía extrema que requiere **acción inmediata**. Impacto significativo en la operación. | Investigar y resolver de inmediato. Notificar al equipo on-call. |
-| **🟡 WARNING** | WARNING | Degradación moderada o anomalía significativa que requiere **monitoreo activo**. Puede escalar a CRITICAL si no se atiende. | Revisar en próximas 1-2 horas. Preparar plan de acción. |
-| **🟢 FINE** | FINE | Métrica dentro del rango normal esperado. Operación normal. | No se requiere acción. Continuar monitoreo de rutina. |
-| **⚪ INSUFFICIENT_DATA** | INSUFFICIENT_DATA | No hay suficientes datos para determinar confiablemente. Puede ser normal durante horas de bajo tráfico. | Revisar si persiste en horas pico. Verificar integración de datos. |
-
-#### Umbrales por Tipo de Alerta
-
-**Alertas basadas en Threshold Fijo (Alert 1, 2, 3):**
-
-| Severity | Alert 1 (Hourly Quality) | Alert 2 (Daily Quality) | Alert 3 (Daily Volume) |
-|----------|--------------------------|-------------------------|------------------------|
-| **CRITICAL** | Caída > 30% vs LW<br>`ratio < 0.70` | Caída > 30% vs Y **AND** 30D<br>`ratio < 0.70` en ambos | Caída > 30% vs LW **AND** 30D<br>`ratio < 0.70` en ambos |
-| **WARNING** | Caída 10-30% vs LW<br>`0.70 ≤ ratio < 0.90` | Caída 10-30% vs Y **AND** 30D<br>`0.70 ≤ ratio < 0.90` en ambos | Caída 10-30% vs LW **AND** 30D<br>`0.70 ≤ ratio < 0.90` en ambos |
-| **FINE** | Caída < 10%<br>`ratio ≥ 0.90` | Caída < 10% en al menos una baseline | Caída < 10% en al menos una baseline |
-| **INSUFFICIENT_DATA** | `calls < 20` en T o LW | `calls < 50` en T o Y<br>O `days < 20` en 30D | `weekday_count < 3`<br>O `avg < 30`<br>O `LW < 50` |
-
-**Alertas basadas en Detección Estadística (Alert 4, 5):**
-
-| Severity | Alert 4 (Short Call Rate) | Alert 5 (Call Duration) |
-|----------|---------------------------|------------------------|
-| **CRITICAL** | `rate > μ + 3σ`<br>O `rate > P95 * 1.2` con ≥10 short calls | `\|duration - μ\| > 3σ`<br>(cualquier dirección) |
-| **WARNING** | `rate > μ + 2σ`<br>con ≥5 short calls | `\|duration - μ\| > 2σ`<br>(cualquier dirección) |
-| **FINE** | `rate ≤ μ + 2σ` | `\|duration - μ\| ≤ 2σ` |
-| **INSUFFICIENT_DATA** | `calls < 10`<br>O `baseline_hours < 10` | `calls < 10`<br>O `baseline_hours < 10` |
-
-#### Consideraciones Importantes
-
-1. **Alertas con Dual Baseline (Alert 2 y 3):**
-   - Usan **operador AND** lógico
-   - Solo alertan si AMBAS condiciones se cumplen simultáneamente
-   - Esto reduce significativamente los falsos positivos
-
-2. **Alertas Estadísticas (Alert 4 y 5):**
-   - Usan desviación estándar (σ) como umbral dinámico
-   - Se adaptan automáticamente a la variabilidad histórica
-   - Alert 5 es bidireccional (detecta TOO_SHORT y TOO_LONG)
-
-3. **Requisitos de Datos Mínimos:**
-   - Varían por alerta según granularidad y tipo de comparación
-   - Diseñados para evitar alertas basadas en muestras pequeñas no representativas
-   - INSUFFICIENT_DATA no es un error, es una salvaguarda de calidad
-
-4. **Horarios Operacionales:**
-   - Alert 1, 4, 5: Solo alertan entre 6:00 AM - 11:00 PM
-   - Alert 2: Opera todo el día
-   - Alert 3: Solo alerta después de 1:00 PM (para tener suficiente data acumulada)
-
----
-
-## 📚 Uso de las Alertas
-
-### Vistas Disponibles por Alerta
-
-Cada alerta tiene **DOS archivos SQL**:
-
-1. **`alert_X.sql`** (Vista de Alertas)
-   - Solo muestra alertas activas (CRITICAL y WARNING)
-   - Incluye mensaje de alerta descriptivo
-   - Filtrada por horario operacional
-   - Requiere muestra mínima de datos
-
-2. **`normal_alert_X.sql`** (Vista de Métricas)
-   - Muestra TODAS las organizaciones con sus métricas
-   - No filtra por severidad
-   - Incluye columna `alert_severity` para análisis
-   - Útil para monitoreo preventivo y análisis histórico
-
-### Filtros en Metabase
-
-Todas las vistas soportan filtros variables:
-- `{{organization_name}}`: Filtrar por organización
+| `created_date` | DATE | Fecha de la llamada |
+| `hour_of_day` | INTEGER | Hora del día (0-23) |
+| `total_calls` | INTEGER | Conteo de llamadas |
+| `block_status` | VARCHAR | Estado visual: `CURRENT_HOUR`, `TODAY_COMPLETED`, `TODAY_PENDING`, `PAST_DAY` |
+| `block_label` | VARCHAR | Etiqueta para tooltip: "Lun 2025-12-22 - 14:00" |
+| `day_label` | VARCHAR | Día formateado: "Lunes 22/12" |
+
+**Filtros disponibles:**
+- `{{time}}`: Rango de fechas
+- `{{organization_name}}`: Filtrar por organización específica
 - `{{countries}}`: Filtrar por país
-- `{{time}}`: Rango de fechas (solo en vistas normales de alert 4 y 5)
 
 ---
 
-**Última actualización:** Diciembre 2025  
-**Versión:** 1.0  
-**Contacto:** Data Engineering Team
+### Tab 2: Alertas
 
+**Propósito:** Mostrar alertas activas (CRITICAL y WARNING) que requieren atención.
+
+#### Alertas Principales
+
+| Query | Métrica | Trigger |
+|-------|---------|---------|
+| `alert_1_volume_drop.sql` | `total_calls` | Caída de volumen vs 3 baselines |
+| `alert_2_completion_rate_drop.sql` | `completed_calls / total_calls` | Caída de tasa de completación |
+| `alert_3_quality_rate_drop.sql` | `good_calls / completed_calls` | Caída de calidad de conversación |
+| `alert_4_short_call_rate_spike.sql` | `short_calls / completed_calls` | Spike en llamadas cortas |
+| `alert_5_call_duration_anomaly.sql` | `avg_call_duration_seconds` | Duración anómala (↑ o ↓) |
+
+#### Sub-Alertas (15 queries)
+
+Cada alerta principal tiene 3 sub-alertas que la alimentan:
+
+| Sufijo | Baseline | Ejemplo |
+|--------|----------|---------|
+| `_dod` | Day over Day (ayer) | `sub_alert_11_dod.sql` |
+| `_wow` | Week over Week (semana pasada) | `sub_alert_12_wow.sql` |
+| `_30davg` | Promedio 30 días | `sub_alert_13_30davg.sql` |
+
+**Lógica de disparo:**
+- La alerta principal muestra `CRITICAL` si los 3 sub-alerts son `CRITICAL`
+- La alerta principal muestra `WARNING` si los 3 sub-alerts son `WARNING` o `CRITICAL`
+- Si no hay consenso → `FINE` (no se muestra alerta)
+
+---
+
+### Tab 3: Métricas (Explicación de Alertas)
+
+**Propósito:** Proveer contexto detallado para investigar y entender las alertas.
+
+#### Current Summary
+
+| Query | Descripción |
+|-------|-------------|
+| `current_summary_alert_1.sql` | Estado actual del día para volumen |
+| `current_summary_alert_2.sql` | Estado actual para completion rate |
+| `current_summary_alert_3.sql` | Estado actual para quality rate |
+| `current_summary_alert_4.sql` | Estado actual para short call rate |
+| `current_summary_alert_5.sql` | Estado actual para call duration |
+
+**Contenido:** Muestra TODAS las organizaciones con su estado actual (FINE, WARNING, CRITICAL, INSUFFICIENT_DATA), no solo las alertas activas. Incluye:
+- Valores actuales de la métrica
+- Valores de los 3 baselines (DoD, WoW, 30d avg)
+- Z-scores calculados
+- Severidad de cada sub-alert
+
+#### Hourly Summary
+
+| Query | Descripción |
+|-------|-------------|
+| `hourly_summary_alert_1.sql` | Histórico 7 días por hora - volumen |
+| `hourly_summary_alert_2.sql` | Histórico 7 días por hora - completion rate |
+| `hourly_summary_alert_3.sql` | Histórico 7 días por hora - quality rate |
+| `hourly_summary_alert_4.sql` | Histórico 7 días por hora - short call rate |
+| `hourly_summary_alert_5.sql` | Histórico 7 días por hora - call duration |
+
+**Contenido:** Vista histórica de los últimos 7 días con granularidad horaria. Permite:
+- Ver tendencias y patrones
+- Identificar horas problemáticas recurrentes
+- Comparar días de la semana
+- Detectar degradaciones graduales
+
+---
+
+## 1.4 Niveles de Severidad (Global)
+
+Todas las alertas usan el mismo sistema de 4 niveles de severidad:
+
+| Nivel | Significado | Acción Requerida |
+|-------|-------------|------------------|
+| 🔴 **CRITICAL** | Degradación severa que requiere atención inmediata | Investigación inmediata |
+| 🟡 **WARNING** | Degradación moderada que debe monitorearse | Monitorear, investigar pronto |
+| 🟢 **FINE** | Operación dentro de rangos normales | Ninguna |
+| ⚪ **INSUFFICIENT_DATA** | Datos insuficientes para evaluar confiablemente | Ninguna (esperar más datos) |
+
+> **Nota:** Cada alerta define sus propios umbrales específicos para determinar la severidad, dependiendo de la métrica que monitorea y su metodología de cálculo. Los detalles de umbrales se documentan en la Sección 5 (Detalle por Alerta).
+
+---
+
+# 2. TAB 1: CHARTS (Visualización)
+
+## 2.1 Propósito
+
+El Tab de Charts provee **contexto visual** del comportamiento de llamadas. Antes de investigar una alerta, los charts permiten:
+
+- Identificar patrones temporales (horas pico, días de baja actividad)
+- Detectar anomalías visuales que complementan las alertas numéricas
+- Comparar el comportamiento actual vs días anteriores
+- Entender la distribución de volumen por organización
+
+---
+
+## 2.2 Charts Disponibles
+
+### 2.2.1 Total Calls por Día/Hora
+
+**Query:** `charts/total_calls.sql`
+
+**Descripción:** Heatmap que muestra el volumen total de llamadas por cada hora del día, para cada día del rango seleccionado. Permite visualizar patrones de operación y detectar caídas de volumen.
+
+**Visualización recomendada:** Heatmap o Pivot Table con colores por intensidad.
+
+#### Atributos de Salida
+
+| Atributo | Tipo | Descripción | Ejemplo |
+|----------|------|-------------|---------|
+| `created_date` | DATE | Fecha de las llamadas | `2025-12-22` |
+| `organization_name` | VARCHAR | Nombre de la organización | `Rappi` |
+| `country` | VARCHAR(2) | Código ISO del país | `PE` |
+| `hour_of_day` | INTEGER | Hora del día (0-23) | `14` |
+| `total_calls` | INTEGER | Cantidad total de llamadas en esa hora | `87` |
+| `block_status` | VARCHAR | Estado del bloque temporal para visualización | `PAST_DAY` |
+| `block_label` | VARCHAR | Etiqueta corta para tooltips | `Lun 2025-12-22 - 14:00` |
+| `day_label` | VARCHAR | Día formateado legible | `Lunes 22/12` |
+
+#### Valores de `block_status`
+
+| Valor | Significado |
+|-------|-------------|
+| `CURRENT_HOUR` | Es la hora actual del día de hoy |
+| `TODAY_COMPLETED` | Hora de hoy que ya pasó |
+| `TODAY_PENDING` | Hora de hoy que aún no llega |
+| `PAST_DAY` | Hora de un día anterior |
+
+#### Filtros Disponibles
+
+| Filtro | Variable Metabase | Descripción |
+|--------|-------------------|-------------|
+| Rango de fechas | `{{time}}` | Filtra el período a visualizar |
+| Organización | `{{organization_name}}` | Filtra por una organización específica |
+| País | `{{countries}}` | Filtra por uno o más países |
+
+#### Ejemplo de Resultado (Rappi PE - Semana del 16-22 Dic 2025)
+
+| created_date | hour_of_day | total_calls | block_status | day_label |
+|--------------|-------------|-------------|--------------|-----------|
+| 2025-12-16 | 8 | 12 | PAST_DAY | Lunes 16/12 |
+| 2025-12-16 | 9 | 45 | PAST_DAY | Lunes 16/12 |
+| 2025-12-16 | 10 | 78 | PAST_DAY | Lunes 16/12 |
+| 2025-12-16 | 11 | 92 | PAST_DAY | Lunes 16/12 |
+| 2025-12-16 | 12 | 85 | PAST_DAY | Lunes 16/12 |
+| ... | ... | ... | ... | ... |
+| 2025-12-22 | 14 | 67 | TODAY_COMPLETED | Domingo 22/12 |
+| 2025-12-22 | 15 | 43 | CURRENT_HOUR | Domingo 22/12 |
+| 2025-12-22 | 16 | 0 | TODAY_PENDING | Domingo 22/12 |
+
+---
+
+### 2.2.2 Completed Calls por Día/Hora
+
+**Query:** `charts/completed_calls.sql`
+
+**Descripción:** Heatmap similar al anterior pero contando únicamente las llamadas completadas (excluye `failed` y `voicemail`). Útil para visualizar el volumen efectivo de contactos realizados.
+
+**Visualización recomendada:** Heatmap o Pivot Table con colores por intensidad.
+
+#### Atributos de Salida
+
+Los atributos son idénticos a `total_calls.sql`. La diferencia está en el filtro interno de la query que solo cuenta llamadas con `call_classification IN ('good_calls', 'short_calls', 'completed')`.
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `created_date` | DATE | Fecha de las llamadas |
+| `organization_name` | VARCHAR | Nombre de la organización |
+| `country` | VARCHAR(2) | Código ISO del país |
+| `hour_of_day` | INTEGER | Hora del día (0-23) |
+| `total_calls` | INTEGER | Cantidad de **completed calls** en esa hora |
+| `block_status` | VARCHAR | Estado del bloque temporal |
+| `block_label` | VARCHAR | Etiqueta para tooltips |
+| `day_label` | VARCHAR | Día formateado legible |
+
+#### Filtros Disponibles
+
+| Filtro | Variable Metabase | Descripción |
+|--------|-------------------|-------------|
+| Rango de fechas | `{{time}}` | Filtra el período a visualizar |
+| Organización | `{{organization_name}}` | Filtra por una organización específica |
+| País | `{{countries}}` | Filtra por uno o más países |
+
+---
+
+### 2.2.3 Total Calls - Todas las Organizaciones
+
+**Query:** `charts/total_calls_all_orgs.sql`
+
+**Descripción:** Vista agregada que muestra el volumen de llamadas por hora/día para **todas las organizaciones** simultáneamente. Permite comparar volúmenes relativos entre organizaciones y detectar si un problema es generalizado o específico de una organización.
+
+**Visualización recomendada:** Stacked bar chart por organización, o tabla pivoteada con organizaciones como columnas.
+
+#### Atributos de Salida
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `created_date` | DATE | Fecha de las llamadas |
+| `organization_name` | VARCHAR | Nombre de la organización |
+| `country` | VARCHAR(2) | Código ISO del país |
+| `hour_of_day` | INTEGER | Hora del día (0-23) |
+| `total_calls` | INTEGER | Cantidad total de llamadas |
+| `block_status` | VARCHAR | Estado del bloque temporal |
+| `block_label` | VARCHAR | Etiqueta para tooltips |
+| `day_label` | VARCHAR | Día formateado legible |
+
+#### Filtros Disponibles
+
+| Filtro | Variable Metabase | Descripción |
+|--------|-------------------|-------------|
+| Rango de fechas | `{{time}}` | Filtra el período a visualizar |
+| País | `{{countries}}` | Filtra por uno o más países |
+
+> **Nota:** Este chart NO incluye filtro de `{{organization_name}}` porque su propósito es mostrar todas las organizaciones juntas.
+
+#### Ejemplo de Uso
+
+Comparar el volumen del Lunes 16/12 a las 10:00 AM entre organizaciones:
+
+| organization_name | country | total_calls |
+|-------------------|---------|-------------|
+| Rappi | PE | 78 |
+| Rappi | CO | 134 |
+| Rappi | MX | 256 |
+| Otro Cliente | PE | 45 |
+
+---
+
+## 2.3 Query SQL de Referencia
+
+```sql
+-- total_calls.sql (estructura simplificada)
+WITH hourly_data AS (
+  SELECT
+    created_date,
+    country,
+    organization_name,
+    hour_of_day,
+    COUNT(*) AS total_calls,
+    
+    -- Estado del bloque para visualización
+    CASE 
+      WHEN created_date = CURRENT_DATE() 
+        AND hour_of_day = EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
+        THEN 'CURRENT_HOUR'
+      WHEN created_date = CURRENT_DATE()
+        AND hour_of_day <= EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
+        THEN 'TODAY_COMPLETED'
+      WHEN created_date = CURRENT_DATE()
+        AND hour_of_day > EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
+        THEN 'TODAY_PENDING'
+      ELSE 'PAST_DAY'
+    END AS block_status
+    
+  FROM ai_calls_detail
+  WHERE TRUE
+    [[AND {{time}}]]
+    [[AND {{organization_name}}]]
+    [[AND {{countries}}]]
+  GROUP BY created_date, hour_of_day, country, organization_name
+)
+SELECT * FROM hourly_data
+ORDER BY created_date, hour_of_day;
+```
+
+---
+
+*Continúa en Sección 3: Tab 2 - Alertas*
+
+---
+
+# 3. TAB 2: ALERTAS
+
+## 3.1 Propósito
+
+El Tab de Alertas muestra las **alertas activas** (CRITICAL y WARNING) que requieren atención del equipo. Solo aparecen alertas cuando se detecta una anomalía confirmada por múltiples baselines.
+
+---
+
+## 3.2 Estructura de Alertas
+
+### Alertas Principales vs Sub-Alertas
+
+El sistema usa una arquitectura de **dos niveles**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ALERTA PRINCIPAL                             │
+│                    (alert_X.sql)                                │
+│                                                                 │
+│   Solo se dispara si los 3 sub-alerts coinciden en             │
+│   WARNING o CRITICAL simultáneamente                            │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │ Sub-Alert   │  │ Sub-Alert   │  │ Sub-Alert   │             │
+│  │    X.1      │  │    X.2      │  │    X.3      │             │
+│  │   (DoD)     │  │   (WoW)     │  │  (30d Avg)  │             │
+│  └─────────────┘  └─────────────┘  └─────────────┘             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Lógica de Disparo
+
+| Condición | Resultado en Alerta Principal |
+|-----------|-------------------------------|
+| Los 3 sub-alerts son `CRITICAL` | `CRITICAL` |
+| Los 3 sub-alerts son `WARNING` o `CRITICAL` (mezclados) | `WARNING` |
+| Al menos 1 sub-alert es `FINE` o `INSUFFICIENT_DATA` | No se dispara (no aparece) |
+
+Esta lógica de **consenso** reduce significativamente los falsos positivos.
+
+---
+
+## 3.3 Las 5 Alertas Principales
+
+| # | Nombre | Query | Métrica | Dirección |
+|---|--------|-------|---------|-----------|
+| 1 | Volume Drop | `alert_1_volume_drop.sql` | `total_calls` | Lower is bad ↓ |
+| 2 | Completion Rate Drop | `alert_2_completion_rate_drop.sql` | `completed_calls / total_calls` | Lower is bad ↓ |
+| 3 | Quality Rate Drop | `alert_3_quality_rate_drop.sql` | `good_calls / completed_calls` | Lower is bad ↓ |
+| 4 | Short Call Rate Spike | `alert_4_short_call_rate_spike.sql` | `short_calls / completed_calls` | Higher is bad ↑ |
+| 5 | Call Duration Anomaly | `alert_5_call_duration_anomaly.sql` | `avg_call_duration_seconds` | Bidireccional ↕ |
+
+### Resumen de Cada Alerta
+
+#### Alert 1: Volume Drop
+- **Qué detecta:** Caída significativa en el número total de llamadas realizadas
+- **Cuándo es problema:** Cuando hay menos llamadas de las esperadas vs los 3 baselines
+- **Posibles causas:** Sistema caído, integración fallida, problema de envío de datos del cliente
+
+#### Alert 2: Completion Rate Drop
+- **Qué detecta:** Caída en el porcentaje de llamadas que logran conectar
+- **Fórmula:** `completed_calls / total_calls`
+- **Cuándo es problema:** Muchas llamadas fallan antes de conectar
+- **Posibles causas:** Números inválidos, problemas de telefonía, carrier issues
+
+#### Alert 3: Quality Rate Drop
+- **Qué detecta:** Caída en el porcentaje de conversaciones efectivas
+- **Fórmula:** `good_calls / completed_calls`
+- **Cuándo es problema:** Las llamadas conectan pero no logran engagement
+- **Posibles causas:** Problemas de script, audio, o comportamiento del agente
+
+#### Alert 4: Short Call Rate Spike
+- **Qué detecta:** Aumento anormal en llamadas que terminan muy rápido
+- **Fórmula:** `short_calls / completed_calls`
+- **Cuándo es problema:** Usuarios cuelgan inmediatamente después de contestar
+- **Posibles causas:** Primera impresión mala, problemas de audio, script inicial confuso
+
+#### Alert 5: Call Duration Anomaly
+- **Qué detecta:** Duración promedio de llamadas fuera de lo normal (muy cortas O muy largas)
+- **Métrica:** `avg_call_duration_seconds`
+- **Cuándo es problema:** 
+  - TOO_SHORT: Llamadas terminan antes de lo esperado
+  - TOO_LONG: Bot posiblemente atrapado en loops
+- **Posibles causas:** Cambios en lógica del bot, problemas de finalización de llamada
+
+---
+
+## 3.4 Los 15 Sub-Alerts
+
+Cada alerta principal tiene 3 sub-alerts que comparan contra diferentes baselines:
+
+### Estructura de Nomenclatura
+
+`sub_alert_XY_tipo.sql`
+
+Donde:
+- `X` = Número de alerta (1-5)
+- `Y` = Número de sub-alert (1-3)
+- `tipo` = Baseline usado (dod, wow, 30davg)
+
+### Listado Completo
+
+| Sub-Alert | Query | Baseline | Stddev Usado |
+|-----------|-------|----------|--------------|
+| **Alert 1: Volume Drop** ||||
+| 1.1 | `sub_alert_11_dod.sql` | Ayer mismo momento | `stddev_all_days` |
+| 1.2 | `sub_alert_12_wow.sql` | Hace 7 días mismo momento | `stddev_same_weekday` |
+| 1.3 | `sub_alert_13_30davg.sql` | Promedio 30d mismo weekday | `stddev_same_weekday` |
+| **Alert 2: Completion Rate Drop** ||||
+| 2.1 | `sub_alert_21_dod.sql` | Ayer mismo momento | `stddev_all_days` |
+| 2.2 | `sub_alert_22_wow.sql` | Hace 7 días mismo momento | `stddev_same_weekday` |
+| 2.3 | `sub_alert_23_30davg.sql` | Promedio 30d mismo weekday | `stddev_same_weekday` |
+| **Alert 3: Quality Rate Drop** ||||
+| 3.1 | `sub_alert_31_dod.sql` | Ayer mismo momento | `stddev_all_days` |
+| 3.2 | `sub_alert_32_wow.sql` | Hace 7 días mismo momento | `stddev_same_weekday` |
+| 3.3 | `sub_alert_33_30davg.sql` | Promedio 30d mismo weekday | `stddev_same_weekday` |
+| **Alert 4: Short Call Rate Spike** ||||
+| 4.1 | `sub_alert_41_dod.sql` | Ayer mismo momento | `stddev_all_days` |
+| 4.2 | `sub_alert_42_wow.sql` | Hace 7 días mismo momento | `stddev_same_weekday` |
+| 4.3 | `sub_alert_43_30davg.sql` | Promedio 30d mismo weekday | `stddev_same_weekday` |
+| **Alert 5: Call Duration Anomaly** ||||
+| 5.1 | `sub_alert_51_dod.sql` | Ayer mismo momento | `stddev_all_days` |
+| 5.2 | `sub_alert_52_wow.sql` | Hace 7 días mismo momento | `stddev_same_weekday` |
+| 5.3 | `sub_alert_53_30davg.sql` | Promedio 30d mismo weekday | `stddev_same_weekday` |
+
+### Explicación de Baselines
+
+| Baseline | Abreviatura | Comparación | Uso de Stddev |
+|----------|-------------|-------------|---------------|
+| **Day over Day** | DoD | Hoy vs Ayer (mismo momento del día) | `stddev_all_days`: varianza de todos los días sin importar día de semana |
+| **Week over Week** | WoW | Hoy vs Hace 7 días (mismo momento) | `stddev_same_weekday`: varianza solo de Lunes vs Lunes, Martes vs Martes, etc. |
+| **30-Day Average** | 30d Avg | Hoy vs Promedio de los últimos 30 días del mismo día de semana | `stddev_same_weekday`: varianza del mismo día de semana |
+
+### ¿Por qué diferentes Stddev?
+
+- **DoD usa `stddev_all_days`:** Porque compara días consecutivos sin importar si ayer fue Lunes o Domingo. La variabilidad día-a-día incluye todos los patrones.
+
+- **WoW y 30d Avg usan `stddev_same_weekday`:** Porque comparan el mismo día de semana (Lunes con Lunes, Viernes con Viernes). La variabilidad debe medirse solo contra días similares.
+
+---
+
+## 3.5 Concepto de Comparación "Apples-to-Apples"
+
+Todas las comparaciones temporales se hacen **hasta el mismo momento del día**, no contra días completos.
+
+### Ejemplo
+
+Si hoy es **Lunes 22 de Diciembre a las 14:30**:
+
+| Baseline | Se compara contra |
+|----------|-------------------|
+| DoD | Domingo 21 de Diciembre, datos hasta las 14:30 |
+| WoW | Lunes 15 de Diciembre, datos hasta las 14:30 |
+| 30d Avg | Promedio de todos los Lunes de los últimos 30 días, cada uno con datos hasta las 14:30 |
+
+### Implementación en SQL
+
+```sql
+-- Filtro "apples-to-apples" usado en todos los baselines
+AND (
+    EXTRACT(HOUR FROM created_at) < EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
+    OR (
+        EXTRACT(HOUR FROM created_at) = EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
+        AND EXTRACT(MINUTE FROM created_at) <= EXTRACT(MINUTE FROM CURRENT_TIMESTAMP())
+    )
+)
+```
+
+Este filtro asegura que solo se incluyan llamadas hasta la misma hora:minuto del día actual.
+
+---
+
+## 3.6 Atributos Comunes de Salida (Alertas Principales)
+
+Las alertas principales comparten una estructura de salida similar:
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `organization_name` | VARCHAR | Nombre de la organización |
+| `country` | VARCHAR(2) | Código ISO del país |
+| `current_*` | FLOAT/INT | Valor actual de la métrica |
+| `baseline_dod_*` | FLOAT/INT | Valor del baseline DoD |
+| `baseline_wow_*` | FLOAT/INT | Valor del baseline WoW |
+| `baseline_30d_*` | FLOAT/INT | Valor del baseline 30d Avg |
+| `z_score_dod` | FLOAT | Desviación estándar vs DoD |
+| `z_score_wow` | FLOAT | Desviación estándar vs WoW |
+| `z_score_30d` | FLOAT | Desviación estándar vs 30d Avg |
+| `severity_dod` | VARCHAR | Severidad del sub-alert DoD |
+| `severity_wow` | VARCHAR | Severidad del sub-alert WoW |
+| `severity_30d` | VARCHAR | Severidad del sub-alert 30d Avg |
+| `main_severity` | VARCHAR | Severidad final de la alerta principal |
+| `alert_message` | VARCHAR | Mensaje descriptivo de la alerta |
+
+---
+
+## 3.7 Filtros Disponibles
+
+| Filtro | Variable Metabase | Disponible en |
+|--------|-------------------|---------------|
+| Organización | `{{organization_name}}` | Todas las alertas |
+| País | `{{countries}}` | Todas las alertas |
+
+> **Nota:** Las alertas no tienen filtro de fecha porque siempre muestran el estado **actual** en tiempo real.
+
+---
+
+*Continúa en Sección 4: Tab 3 - Métricas*
+
+---
+
+# 4. TAB 3: MÉTRICAS (Explicación de Alertas)
+
+## 4.1 Propósito
+
+El Tab de Métricas provee **contexto detallado** para investigar y entender las alertas. A diferencia del Tab 2 que solo muestra alertas activas, este tab muestra:
+
+- **Todas las organizaciones** con su estado actual (incluyendo FINE e INSUFFICIENT_DATA)
+- **Valores de todos los baselines** para comparación manual
+- **Z-scores calculados** para entender la magnitud de las desviaciones
+- **Histórico por hora** para identificar patrones y tendencias
+
+---
+
+## 4.2 Current Summary
+
+### Descripción
+
+Las queries de `current_summary` muestran el **estado actual del día** para cada métrica. Proveen una foto instantánea de todas las organizaciones con sus valores actuales, baselines y severidades calculadas.
+
+### Queries Disponibles
+
+| Query | Métrica Monitoreada |
+|-------|---------------------|
+| `current_summary_alert_1.sql` | Volume (total_calls) |
+| `current_summary_alert_2.sql` | Completion Rate (completed_calls / total_calls) |
+| `current_summary_alert_3.sql` | Quality Rate (good_calls / completed_calls) |
+| `current_summary_alert_4.sql` | Short Call Rate (short_calls / completed_calls) |
+| `current_summary_alert_5.sql` | Call Duration (avg_call_duration_seconds) |
+
+### Atributos de Salida (Ejemplo: current_summary_alert_1)
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `organization_name` | VARCHAR | Nombre de la organización |
+| `country` | VARCHAR(2) | Código ISO del país |
+| `current_total_calls` | INTEGER | Llamadas totales hoy hasta este momento |
+| `baseline_dod_total_calls` | INTEGER | Llamadas de ayer al mismo momento |
+| `baseline_wow_total_calls` | INTEGER | Llamadas hace 7 días al mismo momento |
+| `baseline_30d_avg_total_calls` | FLOAT | Promedio de llamadas de los últimos 30 días (mismo weekday, mismo momento) |
+| `absolute_change_dod` | INTEGER | Diferencia absoluta vs ayer |
+| `absolute_change_wow` | INTEGER | Diferencia absoluta vs semana pasada |
+| `absolute_change_30d` | FLOAT | Diferencia absoluta vs promedio 30d |
+| `pct_change_dod` | FLOAT | Cambio porcentual vs ayer |
+| `pct_change_wow` | FLOAT | Cambio porcentual vs semana pasada |
+| `pct_change_30d` | FLOAT | Cambio porcentual vs promedio 30d |
+| `z_score_dod` | FLOAT | Desviaciones estándar vs ayer |
+| `z_score_wow` | FLOAT | Desviaciones estándar vs semana pasada |
+| `z_score_30d` | FLOAT | Desviaciones estándar vs promedio 30d |
+| `severity_dod` | VARCHAR | Severidad del sub-alert DoD |
+| `severity_wow` | VARCHAR | Severidad del sub-alert WoW |
+| `severity_30d` | VARCHAR | Severidad del sub-alert 30d |
+| `main_severity` | VARCHAR | Severidad combinada (requiere consenso de los 3) |
+
+### Ejemplo de Resultado (Rappi PE - 22 Dic 2025 a las 14:30)
+
+| organization_name | country | current_total_calls | baseline_dod | baseline_wow | baseline_30d_avg | z_score_dod | z_score_wow | z_score_30d | severity_dod | severity_wow | severity_30d | main_severity |
+|-------------------|---------|---------------------|--------------|--------------|------------------|-------------|-------------|-------------|--------------|--------------|--------------|---------------|
+| Rappi | PE | 245 | 312 | 287 | 295 | -2.3 | -1.8 | -2.1 | WARNING | FINE | WARNING | FINE |
+| Rappi | CO | 456 | 423 | 445 | 438 | 0.8 | 0.3 | 0.5 | FINE | FINE | FINE | FINE |
+| Rappi | MX | 89 | 245 | 234 | 228 | -3.1 | -2.8 | -2.9 | CRITICAL | CRITICAL | CRITICAL | CRITICAL |
+
+**Interpretación del ejemplo:**
+- **Rappi PE:** Tiene z-scores negativos pero solo 2 de 3 sub-alerts son WARNING → `main_severity = FINE` (no hay consenso)
+- **Rappi CO:** Todos los z-scores están cerca de 0 → Todo FINE
+- **Rappi MX:** Los 3 sub-alerts son CRITICAL → `main_severity = CRITICAL` (hay consenso)
+
+### Filtros Disponibles
+
+| Filtro | Variable Metabase | Descripción |
+|--------|-------------------|-------------|
+| Organización | `{{organization_name}}` | Filtrar por organización específica |
+| País | `{{country}}` | Filtrar por país |
+
+---
+
+## 4.3 Hourly Summary
+
+### Descripción
+
+Las queries de `hourly_summary` muestran el **histórico de los últimos 7 días con granularidad horaria**. Permiten:
+
+- Ver la evolución temporal de cada métrica
+- Identificar horas del día problemáticas de forma recurrente
+- Comparar el comportamiento entre días de la semana
+- Detectar degradaciones graduales que no disparan alertas instantáneas
+
+### Queries Disponibles
+
+| Query | Métrica Monitoreada |
+|-------|---------------------|
+| `hourly_summary_alert_1.sql` | Volume (total_calls) |
+| `hourly_summary_alert_2.sql` | Completion Rate |
+| `hourly_summary_alert_3.sql` | Quality Rate |
+| `hourly_summary_alert_4.sql` | Short Call Rate |
+| `hourly_summary_alert_5.sql` | Call Duration |
+
+### Atributos de Salida (Ejemplo: hourly_summary_alert_1)
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `eval_hour` | TIMESTAMP | Hora evaluada (truncada a hora) |
+| `eval_date` | DATE | Fecha de la evaluación |
+| `hour_of_day` | INTEGER | Hora del día (0-23) |
+| `day_of_week` | INTEGER | Día de la semana (1=Domingo, 7=Sábado) |
+| `organization_name` | VARCHAR | Nombre de la organización |
+| `country` | VARCHAR(2) | Código ISO del país |
+| `current_total_calls` | INTEGER | Llamadas en esa hora |
+| `baseline_dod_total_calls` | INTEGER | Llamadas del día anterior a la misma hora |
+| `baseline_wow_total_calls` | INTEGER | Llamadas de hace 7 días a la misma hora |
+| `baseline_30d_avg_total_calls` | FLOAT | Promedio de la misma hora en los últimos 30 días |
+| `absolute_change_dod` | INTEGER | Diferencia vs día anterior |
+| `absolute_change_wow` | INTEGER | Diferencia vs semana pasada |
+| `z_score_dod` | FLOAT | Z-score vs día anterior |
+| `z_score_wow` | FLOAT | Z-score vs semana pasada |
+| `z_score_30d` | FLOAT | Z-score vs promedio 30d |
+| `severity_dod` | VARCHAR | Severidad sub-alert DoD para esa hora |
+| `severity_wow` | VARCHAR | Severidad sub-alert WoW para esa hora |
+| `severity_30d` | VARCHAR | Severidad sub-alert 30d para esa hora |
+| `main_severity` | VARCHAR | Severidad combinada para esa hora |
+
+### Ejemplo de Resultado (Rappi PE - Últimos 3 días, horas 9-12)
+
+| eval_date | hour_of_day | current_total_calls | baseline_dod | baseline_wow | z_score_dod | z_score_wow | main_severity |
+|-----------|-------------|---------------------|--------------|--------------|-------------|-------------|---------------|
+| 2025-12-20 | 9 | 45 | 42 | 48 | 0.3 | -0.4 | FINE |
+| 2025-12-20 | 10 | 78 | 81 | 75 | -0.2 | 0.3 | FINE |
+| 2025-12-20 | 11 | 92 | 88 | 95 | 0.4 | -0.3 | FINE |
+| 2025-12-20 | 12 | 85 | 90 | 82 | -0.5 | 0.3 | FINE |
+| 2025-12-21 | 9 | 38 | 45 | 42 | -0.8 | -0.5 | FINE |
+| 2025-12-21 | 10 | 65 | 78 | 81 | -1.2 | -1.5 | FINE |
+| 2025-12-21 | 11 | 71 | 92 | 88 | -2.1 | -1.7 | FINE |
+| 2025-12-21 | 12 | 68 | 85 | 90 | -1.8 | -2.3 | FINE |
+| 2025-12-22 | 9 | 22 | 38 | 45 | -2.4 | -2.8 | WARNING |
+| 2025-12-22 | 10 | 35 | 65 | 78 | -2.9 | -3.1 | CRITICAL |
+| 2025-12-22 | 11 | 41 | 71 | 92 | -2.7 | -3.5 | CRITICAL |
+| 2025-12-22 | 12 | 38 | 68 | 85 | -2.6 | -3.2 | CRITICAL |
+
+**Interpretación del ejemplo:**
+- **20 Dic:** Comportamiento normal, z-scores cercanos a 0
+- **21 Dic:** Empiezan a verse z-scores negativos, pero sin alcanzar umbrales
+- **22 Dic:** Degradación clara, múltiples horas en WARNING y CRITICAL
+
+### Filtros Disponibles
+
+| Filtro | Variable Metabase | Descripción |
+|--------|-------------------|-------------|
+| Organización | `{{organization_name}}` | Filtrar por organización específica |
+| País | `{{country}}` | Filtrar por país |
+
+### Visualización Recomendada
+
+- **Line chart:** Para ver tendencia temporal de la métrica
+- **Heatmap:** Con `eval_date` en Y, `hour_of_day` en X, y color por `main_severity`
+- **Table:** Para análisis detallado de valores específicos
+
+---
+
+## 4.4 Diferencias entre Current Summary y Hourly Summary
+
+| Aspecto | Current Summary | Hourly Summary |
+|---------|-----------------|----------------|
+| **Granularidad temporal** | Acumulado del día hasta el momento actual | Por hora individual |
+| **Rango de datos** | Solo hoy | Últimos 7 días |
+| **Filas por org/país** | 1 fila | Múltiples filas (1 por hora) |
+| **Uso principal** | Estado actual en tiempo real | Análisis de tendencias e histórico |
+| **Cuándo usar** | Monitoreo continuo, investigación inmediata | Análisis post-mortem, identificación de patrones |
+
+---
+
+## 4.5 Cómo Usar el Tab de Métricas
+
+### Escenario 1: Investigar una alerta activa
+
+1. Ver la alerta en Tab 2 (Alertas)
+2. Ir a Tab 3 → Current Summary de la métrica correspondiente
+3. Revisar los z-scores individuales para entender cuál baseline tiene mayor desviación
+4. Ir a Hourly Summary para ver si es un problema reciente o una tendencia
+
+### Escenario 2: Monitoreo proactivo
+
+1. Revisar Current Summary periódicamente
+2. Identificar organizaciones con z-scores negativos aunque no hayan disparado alerta
+3. Monitorear si los z-scores empeoran con el tiempo
+
+### Escenario 3: Análisis post-mortem
+
+1. Ir a Hourly Summary
+2. Filtrar por la organización afectada
+3. Identificar el momento exacto donde comenzó la degradación
+4. Correlacionar con eventos conocidos (deploys, cambios de configuración, etc.)
+
+---
+
+*Continúa en Sección 5: Detalle por Alerta*
+
+---
+
+# 5. DETALLE POR ALERTA
+
+Esta sección documenta cada alerta en profundidad: fórmulas de cálculo, umbrales, justificación estadística y ejemplos prácticos.
+
+---
+
+## 5.1 Alert 1: Volume Drop
+
+### Descripción General
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Objetivo** | Detectar caídas significativas en el volumen de llamadas realizadas |
+| **Métrica** | `total_calls` |
+| **Dirección** | Lower is bad (↓) |
+| **Granularidad** | Diaria acumulada hasta el momento actual |
+| **Query principal** | `alert_1_volume_drop.sql` |
+
+### Fórmula de Cálculo
+
+```
+total_calls = COUNT(*) de ai_calls_detail
+              WHERE created_date = CURRENT_DATE()
+              AND created_at <= CURRENT_TIMESTAMP()
+```
+
+### Sub-Alerts
+
+| Sub-Alert | Query | Baseline | Descripción |
+|-----------|-------|----------|-------------|
+| 1.1 | `sub_alert_11_dod.sql` | Ayer mismo momento | Compara total_calls de hoy vs ayer hasta la misma hora:minuto |
+| 1.2 | `sub_alert_12_wow.sql` | Hace 7 días mismo momento | Compara total_calls de hoy vs hace una semana hasta la misma hora:minuto |
+| 1.3 | `sub_alert_13_30davg.sql` | Promedio 30d mismo weekday | Compara total_calls de hoy vs promedio de los últimos 30 días del mismo día de semana |
+
+### Cálculo del Z-Score
+
+```
+z_score = (valor_actual - valor_baseline) / stddev
+
+Donde:
+- Para DoD: stddev = stddev_all_days (varianza de todos los días)
+- Para WoW y 30d: stddev = stddev_same_weekday (varianza del mismo día de semana)
+```
+
+### Umbrales de Severidad
+
+| Severidad | Condición Z-Score | Interpretación |
+|-----------|-------------------|----------------|
+| 🔴 CRITICAL | z_score < -2.5 | Caída extrema: más de 2.5 desviaciones estándar por debajo |
+| 🟡 WARNING | z_score < -2.0 | Caída significativa: más de 2.0 desviaciones estándar por debajo |
+| 🟢 FINE | z_score >= -2.0 | Dentro del rango normal de variación |
+
+### Criterios de INSUFFICIENT_DATA
+
+| Criterio | Umbral | Razón |
+|----------|--------|-------|
+| Pocas llamadas hoy | < 30 calls | Muestra insuficiente para evaluación confiable |
+| Sin baseline | baseline = NULL | No hay datos del período de comparación |
+| Poca historia | sample_size < 10 (DoD) o < 3 (WoW) | Varianza no representativa |
+| Sin varianza | stddev = 0 | No se puede calcular z-score |
+
+### Ejemplo Práctico (Rappi PE - Lunes 22 Dic 2025 a las 14:30)
+
+**Datos de entrada:**
+
+| Período | total_calls |
+|---------|-------------|
+| Hoy (Lunes hasta 14:30) | 156 |
+| Ayer (Domingo hasta 14:30) | 189 |
+| Hace 7 días (Lunes 15 Dic hasta 14:30) | 245 |
+| Promedio Lunes últimos 30d (hasta 14:30) | 238 |
+| stddev_all_days | 42 |
+| stddev_same_weekday (Lunes) | 35 |
+
+**Cálculos:**
+
+```
+Z-Score DoD = (156 - 189) / 42 = -0.79  → FINE
+Z-Score WoW = (156 - 245) / 35 = -2.54  → CRITICAL
+Z-Score 30d = (156 - 238) / 35 = -2.34  → WARNING
+```
+
+**Resultado:**
+
+| Sub-Alert | Z-Score | Severidad |
+|-----------|---------|-----------|
+| 1.1 (DoD) | -0.79 | FINE |
+| 1.2 (WoW) | -2.54 | CRITICAL |
+| 1.3 (30d) | -2.34 | WARNING |
+| **Main Alert** | - | **FINE** (no hay consenso) |
+
+**Interpretación:** Aunque hay caídas significativas vs la semana pasada y el promedio histórico, la comparación vs ayer está bien. Esto sugiere que el Domingo tuvo bajo volumen (normal para fin de semana) y hoy Lunes aún no recupera. No se dispara alerta porque no hay consenso de los 3 sub-alerts.
+
+### Atributos de Salida Específicos
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `current_total_calls` | INTEGER | Llamadas totales hoy hasta el momento actual |
+| `baseline_dod_total_calls` | INTEGER | Llamadas de ayer al mismo momento |
+| `baseline_wow_total_calls` | INTEGER | Llamadas hace 7 días al mismo momento |
+| `baseline_30d_avg_total_calls` | FLOAT | Promedio de llamadas (mismo weekday, últimos 30d) |
+| `absolute_change_dod` | INTEGER | current - baseline_dod |
+| `absolute_change_wow` | INTEGER | current - baseline_wow |
+| `absolute_change_30d` | FLOAT | current - baseline_30d |
+| `pct_change_dod` | FLOAT | Cambio porcentual vs ayer |
+| `pct_change_wow` | FLOAT | Cambio porcentual vs semana pasada |
+| `pct_change_30d` | FLOAT | Cambio porcentual vs promedio 30d |
+
+---
+
+## 5.2 Alert 2: Completion Rate Drop
+
+### Descripción General
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Objetivo** | Detectar caídas en el porcentaje de llamadas que logran conectar |
+| **Métrica** | `completion_rate = completed_calls / total_calls` |
+| **Dirección** | Lower is bad (↓) |
+| **Granularidad** | Diaria acumulada hasta el momento actual |
+| **Query principal** | `alert_2_completion_rate_drop.sql` |
+
+### Fórmula de Cálculo
+
+```
+completion_rate = completed_calls / total_calls
+
+Donde:
+- completed_calls = COUNT(*) WHERE call_classification IN ('good_calls', 'short_calls', 'completed')
+- total_calls = COUNT(*) de todas las llamadas
+```
+
+**Nota:** Las llamadas `failed` y `voicemail` NO se cuentan como completed.
+
+### Sub-Alerts
+
+| Sub-Alert | Query | Baseline | Descripción |
+|-----------|-------|----------|-------------|
+| 2.1 | `sub_alert_21_dod.sql` | Ayer mismo momento | Compara completion_rate de hoy vs ayer |
+| 2.2 | `sub_alert_22_wow.sql` | Hace 7 días mismo momento | Compara completion_rate de hoy vs hace una semana |
+| 2.3 | `sub_alert_23_30davg.sql` | Promedio 30d mismo weekday | Compara completion_rate de hoy vs promedio histórico |
+
+### Cálculo del Z-Score
+
+```
+z_score = (completion_rate_actual - completion_rate_baseline) / stddev
+
+Donde el stddev se calcula sobre los completion_rates históricos, no sobre conteos.
+```
+
+### Umbrales de Severidad
+
+| Severidad | Condición Z-Score | Interpretación |
+|-----------|-------------------|----------------|
+| 🔴 CRITICAL | z_score < -2.5 | Caída extrema en tasa de completación |
+| 🟡 WARNING | z_score < -2.0 | Caída significativa en tasa de completación |
+| 🟢 FINE | z_score >= -2.0 | Tasa de completación dentro del rango normal |
+
+### Criterios de INSUFFICIENT_DATA
+
+| Criterio | Umbral | Razón |
+|----------|--------|-------|
+| Pocas llamadas hoy | < 30 total_calls | Tasa calculada sobre muestra pequeña no es confiable |
+| Pocas llamadas en baseline | < 30 total_calls | Baseline no confiable |
+| Poca historia | sample_size < 10 (DoD) o < 3 (WoW) | Varianza no representativa |
+| Sin varianza | stddev = 0 | No se puede calcular z-score |
+
+### Ejemplo Práctico (Rappi PE - Lunes 22 Dic 2025 a las 14:30)
+
+**Datos de entrada:**
+
+| Período | total_calls | completed_calls | completion_rate |
+|---------|-------------|-----------------|-----------------|
+| Hoy (Lunes hasta 14:30) | 156 | 118 | 0.756 (75.6%) |
+| Ayer (Domingo hasta 14:30) | 189 | 152 | 0.804 (80.4%) |
+| Hace 7 días (Lunes 15 Dic hasta 14:30) | 245 | 208 | 0.849 (84.9%) |
+| Promedio Lunes últimos 30d | - | - | 0.832 (83.2%) |
+| stddev_all_days | - | - | 0.045 |
+| stddev_same_weekday (Lunes) | - | - | 0.038 |
+
+**Cálculos:**
+
+```
+Z-Score DoD = (0.756 - 0.804) / 0.045 = -1.07  → FINE
+Z-Score WoW = (0.756 - 0.849) / 0.038 = -2.45  → WARNING
+Z-Score 30d = (0.756 - 0.832) / 0.038 = -2.00  → WARNING
+```
+
+**Resultado:**
+
+| Sub-Alert | Z-Score | Severidad |
+|-----------|---------|-----------|
+| 2.1 (DoD) | -1.07 | FINE |
+| 2.2 (WoW) | -2.45 | WARNING |
+| 2.3 (30d) | -2.00 | WARNING |
+| **Main Alert** | - | **FINE** (no hay consenso, DoD es FINE) |
+
+**Interpretación:** La tasa de completación está por debajo del histórico semanal y mensual, pero comparado con ayer no hay caída significativa. Esto sugiere que la tasa baja viene de días anteriores, no es un problema nuevo de hoy.
+
+### Atributos de Salida Específicos
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `current_total_calls` | INTEGER | Llamadas totales hoy |
+| `current_completed_calls` | INTEGER | Llamadas completadas hoy |
+| `current_completion_rate` | FLOAT | Tasa de completación actual (0-1) |
+| `baseline_dod_rate` | FLOAT | Tasa de completación de ayer |
+| `baseline_wow_rate` | FLOAT | Tasa de completación hace 7 días |
+| `baseline_30d_rate` | FLOAT | Tasa promedio de completación (mismo weekday, 30d) |
+| `pp_change_dod` | FLOAT | Cambio en puntos porcentuales vs ayer |
+| `pp_change_wow` | FLOAT | Cambio en puntos porcentuales vs semana pasada |
+| `pp_change_30d` | FLOAT | Cambio en puntos porcentuales vs promedio 30d |
+
+---
+
+## 5.3 Alert 3: Quality Rate Drop
+
+### Descripción General
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Objetivo** | Detectar caídas en el porcentaje de conversaciones efectivas |
+| **Métrica** | `quality_rate = good_calls / completed_calls` |
+| **Dirección** | Lower is bad (↓) |
+| **Granularidad** | Diaria acumulada hasta el momento actual |
+| **Query principal** | `alert_3_quality_rate_drop.sql` |
+
+### Fórmula de Cálculo
+
+```
+quality_rate = good_calls / completed_calls
+
+Donde:
+- good_calls = COUNT(*) WHERE call_classification = 'good_calls'
+- completed_calls = COUNT(*) WHERE call_classification IN ('good_calls', 'short_calls', 'completed')
+```
+
+**Diferencia con Completion Rate:**
+- **Completion Rate:** Mide qué porcentaje de llamadas CONECTA (vs las que fallan)
+- **Quality Rate:** Mide qué porcentaje de llamadas conectadas son EFECTIVAS (good vs short)
+
+### Sub-Alerts
+
+| Sub-Alert | Query | Baseline | Descripción |
+|-----------|-------|----------|-------------|
+| 3.1 | `sub_alert_31_dod.sql` | Ayer mismo momento | Compara quality_rate de hoy vs ayer |
+| 3.2 | `sub_alert_32_wow.sql` | Hace 7 días mismo momento | Compara quality_rate de hoy vs hace una semana |
+| 3.3 | `sub_alert_33_30davg.sql` | Promedio 30d mismo weekday | Compara quality_rate de hoy vs promedio histórico |
+
+### Cálculo del Z-Score
+
+```
+z_score = (quality_rate_actual - quality_rate_baseline) / stddev
+```
+
+### Umbrales de Severidad
+
+| Severidad | Condición Z-Score | Interpretación |
+|-----------|-------------------|----------------|
+| 🔴 CRITICAL | z_score < -2.5 | Caída extrema en calidad de conversaciones |
+| 🟡 WARNING | z_score < -2.0 | Caída significativa en calidad |
+| 🟢 FINE | z_score >= -2.0 | Calidad dentro del rango normal |
+
+### Criterios de INSUFFICIENT_DATA
+
+| Criterio | Umbral | Razón |
+|----------|--------|-------|
+| Pocas llamadas completadas hoy | < 30 completed_calls | Tasa sobre muestra pequeña no es confiable |
+| Pocas llamadas completadas en baseline | < 30 completed_calls | Baseline no confiable |
+| Poca historia | sample_size < 10 (DoD) o < 3 (WoW) | Varianza no representativa |
+| Sin varianza | stddev = 0 | No se puede calcular z-score |
+
+### Ejemplo Práctico (Rappi PE - Lunes 22 Dic 2025 a las 14:30)
+
+**Datos de entrada:**
+
+| Período | completed_calls | good_calls | quality_rate |
+|---------|-----------------|------------|--------------|
+| Hoy (Lunes hasta 14:30) | 118 | 72 | 0.610 (61.0%) |
+| Ayer (Domingo hasta 14:30) | 152 | 98 | 0.645 (64.5%) |
+| Hace 7 días (Lunes 15 Dic hasta 14:30) | 208 | 156 | 0.750 (75.0%) |
+| Promedio Lunes últimos 30d | - | - | 0.725 (72.5%) |
+| stddev_all_days | - | - | 0.052 |
+| stddev_same_weekday (Lunes) | - | - | 0.041 |
+
+**Cálculos:**
+
+```
+Z-Score DoD = (0.610 - 0.645) / 0.052 = -0.67  → FINE
+Z-Score WoW = (0.610 - 0.750) / 0.041 = -3.41  → CRITICAL
+Z-Score 30d = (0.610 - 0.725) / 0.041 = -2.80  → CRITICAL
+```
+
+**Resultado:**
+
+| Sub-Alert | Z-Score | Severidad |
+|-----------|---------|-----------|
+| 3.1 (DoD) | -0.67 | FINE |
+| 3.2 (WoW) | -3.41 | CRITICAL |
+| 3.3 (30d) | -2.80 | CRITICAL |
+| **Main Alert** | - | **FINE** (no hay consenso, DoD es FINE) |
+
+**Interpretación:** La calidad está muy por debajo del histórico, pero vs ayer no hay cambio significativo. Esto indica un problema que viene de días anteriores, posiblemente desde el fin de semana. Aunque no dispara alerta principal, amerita investigación.
+
+### Atributos de Salida Específicos
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `current_completed_calls` | INTEGER | Llamadas completadas hoy |
+| `current_good_calls` | INTEGER | Llamadas buenas hoy |
+| `current_quality_rate` | FLOAT | Tasa de calidad actual (0-1) |
+| `baseline_dod_rate` | FLOAT | Tasa de calidad de ayer |
+| `baseline_dod_good` | INTEGER | Good calls de ayer |
+| `baseline_dod_completed` | INTEGER | Completed calls de ayer |
+| `baseline_wow_rate` | FLOAT | Tasa de calidad hace 7 días |
+| `baseline_30d_rate` | FLOAT | Tasa promedio de calidad (mismo weekday, 30d) |
+| `pp_change_dod` | FLOAT | Cambio en puntos porcentuales vs ayer |
+| `pp_change_wow` | FLOAT | Cambio en puntos porcentuales vs semana pasada |
+| `pp_change_30d` | FLOAT | Cambio en puntos porcentuales vs promedio 30d |
+
+---
+
+## 5.4 Alert 4: Short Call Rate Spike
+
+### Descripción General
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Objetivo** | Detectar aumentos anormales en llamadas que terminan muy rápido |
+| **Métrica** | `short_call_rate = short_calls / completed_calls` |
+| **Dirección** | Higher is bad (↑) - Opuesto a las alertas 1-3 |
+| **Granularidad** | Diaria acumulada hasta el momento actual |
+| **Query principal** | `alert_4_short_call_rate_spike.sql` |
+
+### Fórmula de Cálculo
+
+```
+short_call_rate = short_calls / completed_calls
+
+Donde:
+- short_calls = COUNT(*) WHERE call_classification = 'short_calls'
+- completed_calls = COUNT(*) WHERE call_classification IN ('good_calls', 'short_calls', 'completed')
+```
+
+**¿Qué es una short call?**
+Una llamada que conectó pero tuvo una conversación muy breve (< 1000 caracteres de transcripción). Indica que el usuario colgó rápidamente después de contestar.
+
+### Sub-Alerts
+
+| Sub-Alert | Query | Baseline | Descripción |
+|-----------|-------|----------|-------------|
+| 4.1 | `sub_alert_41_dod.sql` | Ayer mismo momento | Compara short_call_rate de hoy vs ayer |
+| 4.2 | `sub_alert_42_wow.sql` | Hace 7 días mismo momento | Compara short_call_rate de hoy vs hace una semana |
+| 4.3 | `sub_alert_43_30davg.sql` | Promedio 30d mismo weekday | Compara short_call_rate de hoy vs promedio histórico |
+
+### Cálculo del Z-Score
+
+```
+z_score = (short_call_rate_actual - short_call_rate_baseline) / stddev
+```
+
+**Importante:** En esta alerta, un z_score POSITIVO es malo (indica spike), al contrario de las alertas 1-3.
+
+### Umbrales de Severidad
+
+| Severidad | Condición Z-Score | Interpretación |
+|-----------|-------------------|----------------|
+| 🔴 CRITICAL | z_score > +2.5 | Spike extremo en llamadas cortas |
+| 🟡 WARNING | z_score > +2.0 | Spike significativo en llamadas cortas |
+| 🟢 FINE | z_score <= +2.0 | Tasa de llamadas cortas dentro del rango normal |
+
+### Criterios de INSUFFICIENT_DATA
+
+| Criterio | Umbral | Razón |
+|----------|--------|-------|
+| Pocas llamadas completadas hoy | < 30 completed_calls | Tasa sobre muestra pequeña no es confiable |
+| Pocas llamadas completadas en baseline | < 30 completed_calls | Baseline no confiable |
+| Poca historia | sample_size < 10 (DoD) o < 3 (WoW) | Varianza no representativa |
+| Sin varianza | stddev = 0 | No se puede calcular z-score |
+
+### Ejemplo Práctico (Rappi PE - Lunes 22 Dic 2025 a las 14:30)
+
+**Datos de entrada:**
+
+| Período | completed_calls | short_calls | short_call_rate |
+|---------|-----------------|-------------|-----------------|
+| Hoy (Lunes hasta 14:30) | 118 | 46 | 0.390 (39.0%) |
+| Ayer (Domingo hasta 14:30) | 152 | 54 | 0.355 (35.5%) |
+| Hace 7 días (Lunes 15 Dic hasta 14:30) | 208 | 52 | 0.250 (25.0%) |
+| Promedio Lunes últimos 30d | - | - | 0.275 (27.5%) |
+| stddev_all_days | - | - | 0.048 |
+| stddev_same_weekday (Lunes) | - | - | 0.039 |
+
+**Cálculos:**
+
+```
+Z-Score DoD = (0.390 - 0.355) / 0.048 = +0.73  → FINE
+Z-Score WoW = (0.390 - 0.250) / 0.039 = +3.59  → CRITICAL
+Z-Score 30d = (0.390 - 0.275) / 0.039 = +2.95  → CRITICAL
+```
+
+**Resultado:**
+
+| Sub-Alert | Z-Score | Severidad |
+|-----------|---------|-----------|
+| 4.1 (DoD) | +0.73 | FINE |
+| 4.2 (WoW) | +3.59 | CRITICAL |
+| 4.3 (30d) | +2.95 | CRITICAL |
+| **Main Alert** | - | **FINE** (no hay consenso, DoD es FINE) |
+
+**Interpretación:** La tasa de short calls es muy alta comparada con el histórico, pero solo ligeramente superior a ayer. El problema viene acumulándose desde días anteriores. La tendencia es preocupante aunque no dispare alerta.
+
+### Atributos de Salida Específicos
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `current_completed_calls` | INTEGER | Llamadas completadas hoy |
+| `current_short_calls` | INTEGER | Llamadas cortas hoy |
+| `current_short_call_rate` | FLOAT | Tasa de llamadas cortas actual (0-1) |
+| `baseline_dod_rate` | FLOAT | Tasa de short calls de ayer |
+| `baseline_dod_short` | INTEGER | Short calls de ayer |
+| `baseline_dod_completed` | INTEGER | Completed calls de ayer |
+| `baseline_wow_rate` | FLOAT | Tasa de short calls hace 7 días |
+| `baseline_30d_rate` | FLOAT | Tasa promedio de short calls (mismo weekday, 30d) |
+| `pp_change_dod` | FLOAT | Cambio en puntos porcentuales vs ayer (positivo = peor) |
+| `pp_change_wow` | FLOAT | Cambio en puntos porcentuales vs semana pasada |
+| `pp_change_30d` | FLOAT | Cambio en puntos porcentuales vs promedio 30d |
+
+---
+
+## 5.5 Alert 5: Call Duration Anomaly
+
+### Descripción General
+
+| Aspecto | Detalle |
+|---------|---------|
+| **Objetivo** | Detectar duración promedio de llamadas fuera de lo normal |
+| **Métrica** | `avg_call_duration_seconds` |
+| **Dirección** | Bidireccional (↕) - Tanto muy corto como muy largo es malo |
+| **Granularidad** | Diaria acumulada hasta el momento actual |
+| **Query principal** | `alert_5_call_duration_anomaly.sql` |
+
+### Fórmula de Cálculo
+
+```
+avg_call_duration_seconds = AVG(call_duration_seconds)
+                            WHERE call_classification IN ('good_calls', 'short_calls', 'completed')
+```
+
+**Nota:** Solo se calcula sobre llamadas completadas, no sobre llamadas fallidas.
+
+### Sub-Alerts
+
+| Sub-Alert | Query | Baseline | Descripción |
+|-----------|-------|----------|-------------|
+| 5.1 | `sub_alert_51_dod.sql` | Ayer mismo momento | Compara duración promedio de hoy vs ayer |
+| 5.2 | `sub_alert_52_wow.sql` | Hace 7 días mismo momento | Compara duración promedio de hoy vs hace una semana |
+| 5.3 | `sub_alert_53_30davg.sql` | Promedio 30d mismo weekday | Compara duración promedio de hoy vs promedio histórico |
+
+### Cálculo del Z-Score
+
+```
+z_score = (avg_duration_actual - avg_duration_baseline) / stddev
+```
+
+### Umbrales de Severidad (BIDIRECCIONAL)
+
+| Severidad | Condición Z-Score | Tipo de Anomalía | Interpretación |
+|-----------|-------------------|------------------|----------------|
+| 🔴 CRITICAL | z_score < -2.5 | TOO_SHORT | Llamadas anormalmente cortas |
+| 🔴 CRITICAL | z_score > +2.5 | TOO_LONG | Llamadas anormalmente largas |
+| 🟡 WARNING | z_score < -2.0 | TOO_SHORT | Llamadas más cortas de lo normal |
+| 🟡 WARNING | z_score > +2.0 | TOO_LONG | Llamadas más largas de lo normal |
+| 🟢 FINE | -2.0 <= z_score <= +2.0 | NORMAL | Duración dentro del rango esperado |
+
+**Importante:** Esta alerta usa el valor absoluto del z-score (`|z_score|`) para determinar severidad, pero preserva el signo para indicar la dirección (TOO_SHORT vs TOO_LONG).
+
+### Criterios de INSUFFICIENT_DATA
+
+| Criterio | Umbral | Razón |
+|----------|--------|-------|
+| Pocas llamadas completadas hoy | < 30 completed_calls | Promedio sobre muestra pequeña es volátil |
+| Pocas llamadas completadas en baseline | < 30 completed_calls | Baseline no confiable |
+| Poca historia | sample_size < 10 (DoD) o < 3 (WoW) | Varianza no representativa |
+| Sin varianza | stddev = 0 | No se puede calcular z-score |
+
+### Ejemplo Práctico - TOO_SHORT (Rappi PE - Lunes 22 Dic 2025 a las 14:30)
+
+**Datos de entrada:**
+
+| Período | completed_calls | avg_duration_seconds |
+|---------|-----------------|----------------------|
+| Hoy (Lunes hasta 14:30) | 118 | 45.2s |
+| Ayer (Domingo hasta 14:30) | 152 | 52.8s |
+| Hace 7 días (Lunes 15 Dic hasta 14:30) | 208 | 78.5s |
+| Promedio Lunes últimos 30d | - | 82.3s |
+| stddev_all_days | - | 12.5s |
+| stddev_same_weekday (Lunes) | - | 9.8s |
+
+**Cálculos:**
+
+```
+Z-Score DoD = (45.2 - 52.8) / 12.5 = -0.61  → FINE
+Z-Score WoW = (45.2 - 78.5) / 9.8 = -3.40  → CRITICAL (TOO_SHORT)
+Z-Score 30d = (45.2 - 82.3) / 9.8 = -3.79  → CRITICAL (TOO_SHORT)
+```
+
+**Resultado:**
+
+| Sub-Alert | Z-Score | Severidad | Tipo |
+|-----------|---------|-----------|------|
+| 5.1 (DoD) | -0.61 | FINE | - |
+| 5.2 (WoW) | -3.40 | CRITICAL | TOO_SHORT |
+| 5.3 (30d) | -3.79 | CRITICAL | TOO_SHORT |
+| **Main Alert** | - | **FINE** | - |
+
+**Interpretación:** Las llamadas son significativamente más cortas que el histórico, pero no vs ayer. Indica que la degradación viene de días anteriores.
+
+### Ejemplo Práctico - TOO_LONG (Escenario Hipotético)
+
+**Datos de entrada (escenario diferente):**
+
+| Período | avg_duration_seconds |
+|---------|----------------------|
+| Hoy | 145.8s |
+| Ayer | 142.3s |
+| Hace 7 días | 78.5s |
+| Promedio 30d | 82.3s |
+
+**Cálculos:**
+
+```
+Z-Score DoD = (145.8 - 142.3) / 12.5 = +0.28  → FINE
+Z-Score WoW = (145.8 - 78.5) / 9.8 = +6.87  → CRITICAL (TOO_LONG)
+Z-Score 30d = (145.8 - 82.3) / 9.8 = +6.48  → CRITICAL (TOO_LONG)
+```
+
+**Interpretación:** Las llamadas duran casi el doble de lo normal. Posible causa: bot atrapado en loops, usuarios confundidos sin poder finalizar, o problema de lógica de terminación.
+
+### Atributos de Salida Específicos
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `current_completed_calls` | INTEGER | Llamadas completadas hoy |
+| `current_avg_duration` | FLOAT | Duración promedio actual en segundos |
+| `baseline_dod_duration` | FLOAT | Duración promedio de ayer |
+| `baseline_dod_completed` | INTEGER | Completed calls de ayer |
+| `baseline_wow_duration` | FLOAT | Duración promedio hace 7 días |
+| `baseline_30d_duration` | FLOAT | Duración promedio histórica (mismo weekday, 30d) |
+| `seconds_change_dod` | FLOAT | Cambio en segundos vs ayer |
+| `seconds_change_wow` | FLOAT | Cambio en segundos vs semana pasada |
+| `seconds_change_30d` | FLOAT | Cambio en segundos vs promedio 30d |
+| `anomaly_type` | VARCHAR | `TOO_SHORT`, `TOO_LONG`, o `NORMAL` |
+
+---
+
+## 5.6 Resumen Comparativo de las 5 Alertas
+
+| Alert | Métrica | Fórmula | Dirección | Z-Score Malo |
+|-------|---------|---------|-----------|--------------|
+| 1 - Volume Drop | `total_calls` | COUNT(*) | ↓ Lower is bad | < -2.0 |
+| 2 - Completion Rate | `completion_rate` | completed / total | ↓ Lower is bad | < -2.0 |
+| 3 - Quality Rate | `quality_rate` | good / completed | ↓ Lower is bad | < -2.0 |
+| 4 - Short Call Spike | `short_call_rate` | short / completed | ↑ Higher is bad | > +2.0 |
+| 5 - Duration Anomaly | `avg_duration` | AVG(seconds) | ↕ Bidireccional | \|z\| > 2.0 |
+
+---
+
+*Continúa en Sección 6: Diccionario de Atributos Global*
+
+---
+
+# 6. DICCIONARIO DE ATRIBUTOS GLOBAL
+
+Esta sección consolida todos los atributos usados en las queries del sistema de alertas, organizados por categoría.
+
+---
+
+## 6.1 Identificadores
+
+| Atributo | Tipo | Descripción | Usado en |
+|----------|------|-------------|----------|
+| `organization_code` | VARCHAR | Código único de la organización | Todas las queries |
+| `organization_name` | VARCHAR | Nombre legible de la organización | Todas las queries |
+| `country` | VARCHAR(2) | Código ISO del país (PE, CO, MX, etc.) | Todas las queries |
+| `created_date` | DATE | Fecha de la llamada | Charts, Hourly Summary |
+| `created_hour` | TIMESTAMP | Hora truncada de la llamada | Hourly Summary |
+| `eval_date` | DATE | Fecha de evaluación (alias de created_date) | Hourly Summary |
+| `eval_hour` | TIMESTAMP | Hora de evaluación (alias de created_hour) | Hourly Summary |
+| `hour_of_day` | INTEGER | Hora del día (0-23) | Charts, Hourly Summary |
+| `day_of_week` | INTEGER | Día de la semana (1=Dom, 7=Sáb) | Hourly Summary |
+
+---
+
+## 6.2 Métricas de Conteo
+
+| Atributo | Tipo | Descripción | Fórmula |
+|----------|------|-------------|---------|
+| `total_calls` | INTEGER | Total de llamadas realizadas | `COUNT(*)` |
+| `completed_calls` | INTEGER | Llamadas que conectaron | `COUNT(*) WHERE call_classification IN ('good_calls', 'short_calls', 'completed')` |
+| `good_calls` | INTEGER | Llamadas con conversación efectiva | `COUNT(*) WHERE call_classification = 'good_calls'` |
+| `short_calls` | INTEGER | Llamadas con conversación muy breve | `COUNT(*) WHERE call_classification = 'short_calls'` |
+| `failed_calls` | INTEGER | Llamadas que no conectaron | `COUNT(*) WHERE call_classification = 'failed'` |
+
+---
+
+## 6.3 Métricas de Tasa (Rate)
+
+| Atributo | Tipo | Rango | Descripción | Fórmula |
+|----------|------|-------|-------------|---------|
+| `completion_rate` | FLOAT | 0-1 | Tasa de llamadas completadas | `completed_calls / total_calls` |
+| `quality_rate` | FLOAT | 0-1 | Tasa de llamadas efectivas | `good_calls / completed_calls` |
+| `short_call_rate` | FLOAT | 0-1 | Tasa de llamadas cortas | `short_calls / completed_calls` |
+| `avg_call_duration_seconds` | FLOAT | 0-∞ | Duración promedio en segundos | `AVG(call_duration_seconds)` |
+
+**Nota:** Todas las tasas se expresan en formato decimal (0.85 = 85%). Para mostrar como porcentaje, multiplicar por 100.
+
+---
+
+## 6.4 Atributos de Baseline
+
+### Prefijos de Baseline
+
+| Prefijo | Significado | Período de Comparación |
+|---------|-------------|------------------------|
+| `baseline_dod_*` | Day over Day | Ayer al mismo momento |
+| `baseline_wow_*` | Week over Week | Hace 7 días al mismo momento |
+| `baseline_30d_*` | 30-Day Average | Promedio últimos 30 días (mismo weekday) |
+
+### Atributos de Baseline por Alerta
+
+| Atributo | Tipo | Alerta | Descripción |
+|----------|------|--------|-------------|
+| `baseline_dod_total_calls` | INTEGER | Alert 1 | Total calls de ayer |
+| `baseline_wow_total_calls` | INTEGER | Alert 1 | Total calls hace 7 días |
+| `baseline_30d_avg_total_calls` | FLOAT | Alert 1 | Promedio de total calls |
+| `baseline_dod_rate` | FLOAT | Alert 2,3,4 | Tasa del día anterior |
+| `baseline_wow_rate` | FLOAT | Alert 2,3,4 | Tasa de hace 7 días |
+| `baseline_30d_rate` | FLOAT | Alert 2,3,4 | Tasa promedio 30d |
+| `baseline_dod_duration` | FLOAT | Alert 5 | Duración promedio de ayer |
+| `baseline_wow_duration` | FLOAT | Alert 5 | Duración promedio hace 7 días |
+| `baseline_30d_duration` | FLOAT | Alert 5 | Duración promedio 30d |
+| `baseline_dod_completed` | INTEGER | Alert 2-5 | Completed calls del baseline DoD |
+| `baseline_wow_completed` | INTEGER | Alert 2-5 | Completed calls del baseline WoW |
+| `baseline_dod_good` | INTEGER | Alert 3 | Good calls del baseline DoD |
+| `baseline_wow_good` | INTEGER | Alert 3 | Good calls del baseline WoW |
+| `baseline_dod_short` | INTEGER | Alert 4 | Short calls del baseline DoD |
+| `baseline_wow_short` | INTEGER | Alert 4 | Short calls del baseline WoW |
+
+---
+
+## 6.5 Atributos de Cambio
+
+### Cambio Absoluto
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `absolute_change_dod` | INTEGER/FLOAT | Diferencia: `current - baseline_dod` |
+| `absolute_change_wow` | INTEGER/FLOAT | Diferencia: `current - baseline_wow` |
+| `absolute_change_30d` | FLOAT | Diferencia: `current - baseline_30d` |
+
+### Cambio Porcentual
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `pct_change_dod` | FLOAT | Cambio porcentual vs ayer: `(current - baseline) / baseline * 100` |
+| `pct_change_wow` | FLOAT | Cambio porcentual vs semana pasada |
+| `pct_change_30d` | FLOAT | Cambio porcentual vs promedio 30d |
+
+### Cambio en Puntos Porcentuales
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `pp_change_dod` | FLOAT | Diferencia en puntos porcentuales vs ayer: `(current_rate - baseline_rate) * 100` |
+| `pp_change_wow` | FLOAT | Diferencia en pp vs semana pasada |
+| `pp_change_30d` | FLOAT | Diferencia en pp vs promedio 30d |
+
+### Cambio en Segundos (Alert 5)
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `seconds_change_dod` | FLOAT | Diferencia en segundos vs ayer |
+| `seconds_change_wow` | FLOAT | Diferencia en segundos vs semana pasada |
+| `seconds_change_30d` | FLOAT | Diferencia en segundos vs promedio 30d |
+
+---
+
+## 6.6 Atributos Estadísticos
+
+### Desviación Estándar (Stddev)
+
+| Atributo | Tipo | Descripción | Cuándo se usa |
+|----------|------|-------------|---------------|
+| `stddev_all_days` | FLOAT | Stddev calculado sobre todos los días de los últimos 30d | Para z-score de DoD |
+| `stddev_same_weekday` | FLOAT | Stddev calculado solo sobre el mismo día de semana | Para z-score de WoW y 30d |
+| `stddev_value` | FLOAT | Alias genérico de stddev | Hourly Summary |
+
+### Z-Score
+
+| Atributo | Tipo | Rango típico | Descripción |
+|----------|------|--------------|-------------|
+| `z_score_dod` | FLOAT | -5 a +5 | Desviaciones estándar vs ayer |
+| `z_score_wow` | FLOAT | -5 a +5 | Desviaciones estándar vs semana pasada |
+| `z_score_30d` | FLOAT | -5 a +5 | Desviaciones estándar vs promedio 30d |
+
+**Interpretación del Z-Score:**
+- `z = 0`: Igual al baseline
+- `z = -2`: 2 desviaciones estándar por debajo (peor para Alert 1-3)
+- `z = +2`: 2 desviaciones estándar por arriba (peor para Alert 4)
+- `|z| = 2`: 2 desviaciones en cualquier dirección (Alert 5)
+
+### Tamaño de Muestra
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `sample_size` | INTEGER | Número de días/horas usados para calcular estadísticas |
+| `sample_size_all_days` | INTEGER | Días con datos en los últimos 30d |
+| `sample_size_weekday` | INTEGER | Días del mismo weekday con datos |
+
+---
+
+## 6.7 Atributos de Severidad
+
+| Atributo | Tipo | Valores Posibles | Descripción |
+|----------|------|------------------|-------------|
+| `severity_dod` | VARCHAR | CRITICAL, WARNING, FINE, INSUFFICIENT_DATA | Severidad del sub-alert DoD |
+| `severity_wow` | VARCHAR | CRITICAL, WARNING, FINE, INSUFFICIENT_DATA | Severidad del sub-alert WoW |
+| `severity_30d` | VARCHAR | CRITICAL, WARNING, FINE, INSUFFICIENT_DATA | Severidad del sub-alert 30d |
+| `main_severity` | VARCHAR | CRITICAL, WARNING, FINE | Severidad combinada (requiere consenso) |
+| `alert_severity` | VARCHAR | CRITICAL, WARNING, FINE, INSUFFICIENT_DATA | Alias de severidad en algunas queries |
+
+### Lógica de main_severity
+
+```
+IF severity_dod = 'CRITICAL' AND severity_wow = 'CRITICAL' AND severity_30d = 'CRITICAL':
+    main_severity = 'CRITICAL'
+ELIF severity_dod IN ('CRITICAL', 'WARNING') 
+     AND severity_wow IN ('CRITICAL', 'WARNING') 
+     AND severity_30d IN ('CRITICAL', 'WARNING'):
+    main_severity = 'WARNING'
+ELSE:
+    main_severity = 'FINE'
+```
+
+---
+
+## 6.8 Atributos de Mensaje
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `alert_message` | VARCHAR | Mensaje descriptivo de la alerta con detalles de métricas |
+| `insufficient_reason` | VARCHAR | Razón específica de INSUFFICIENT_DATA |
+
+### Valores de insufficient_reason
+
+| Valor | Significado |
+|-------|-------------|
+| `NO_BASELINE` | No hay datos del período de comparación |
+| `FEW_COMPLETED_TODAY` | Menos de 30 completed calls hoy |
+| `FEW_COMPLETED_BASELINE` | Menos de 30 completed calls en baseline |
+| `NO_VARIANCE` | Stddev = 0, no se puede calcular z-score |
+| `FEW_SAMPLES` | Pocos días en el historial |
+
+---
+
+## 6.9 Atributos de Visualización (Charts)
+
+| Atributo | Tipo | Descripción |
+|----------|------|-------------|
+| `block_status` | VARCHAR | Estado del bloque temporal: CURRENT_HOUR, TODAY_COMPLETED, TODAY_PENDING, PAST_DAY |
+| `block_label` | VARCHAR | Etiqueta corta para tooltips: "Lun 2025-12-22 - 14:00" |
+| `day_label` | VARCHAR | Día formateado legible: "Lunes 22/12" |
+
+---
+
+## 6.10 Atributos Específicos de Alert 5
+
+| Atributo | Tipo | Valores | Descripción |
+|----------|------|---------|-------------|
+| `anomaly_type` | VARCHAR | TOO_SHORT, TOO_LONG, NORMAL | Tipo de anomalía detectada |
+| `current_avg_duration` | FLOAT | - | Duración promedio actual en segundos |
+
+---
+
+# 7. ANEXOS
+
+## 7.1 Glosario de Términos
+
+| Término | Definición |
+|---------|------------|
+| **Apples-to-Apples** | Metodología de comparación que asegura que se comparan períodos equivalentes (misma hora:minuto del día) |
+| **Baseline** | Valor de referencia contra el cual se compara el valor actual |
+| **Completed Call** | Llamada que logró conectar con el destinatario, independientemente del resultado de la conversación |
+| **DoD (Day over Day)** | Comparación del día actual vs el día anterior |
+| **Failed Call** | Llamada que no logró conectar (número inválido, sin respuesta, buzón de voz) |
+| **Good Call** | Llamada completada con una conversación efectiva (>1000 caracteres de transcripción) |
+| **Main Alert** | Alerta principal que solo se dispara cuando los 3 sub-alerts coinciden |
+| **Short Call** | Llamada completada pero con conversación muy breve (<1000 caracteres) |
+| **Stddev (Standard Deviation)** | Desviación estándar, medida de dispersión de los datos |
+| **Sub-Alert** | Componente individual de una alerta que compara contra un baseline específico |
+| **WoW (Week over Week)** | Comparación del día actual vs el mismo día de la semana anterior |
+| **Z-Score** | Número de desviaciones estándar que un valor está alejado de la media |
+| **30d Avg** | Promedio de los últimos 30 días del mismo día de semana |
+
+---
+
+## 7.2 FAQ / Troubleshooting
+
+### ¿Por qué no se dispara una alerta aunque veo métricas malas?
+
+**Causa más común:** No hay consenso de los 3 sub-alerts.
+
+Para que una alerta principal se dispare, los 3 sub-alerts (DoD, WoW, 30d) deben estar en WARNING o CRITICAL simultáneamente. Si uno de ellos está en FINE, la alerta no se dispara.
+
+**Cómo verificar:**
+1. Ir a Tab 3 → Current Summary de la alerta correspondiente
+2. Revisar las columnas `severity_dod`, `severity_wow`, `severity_30d`
+3. Confirmar si las 3 están en WARNING/CRITICAL
+
+### ¿Por qué aparece INSUFFICIENT_DATA?
+
+**Causas posibles:**
+- Muy pocas llamadas hoy (< 30 completed calls)
+- No hay datos del período de comparación (baseline NULL)
+- Historial insuficiente (< 10 días para DoD, < 3 para WoW)
+- Sin varianza histórica (todos los días idénticos)
+
+**Cómo verificar:**
+1. Revisar la columna `insufficient_reason` en Current Summary
+2. Verificar los conteos en `current_completed_calls` y `baseline_*_completed`
+
+### ¿Por qué el z-score es NULL?
+
+**Causas:**
+- `stddev = 0` (sin varianza histórica)
+- `stddev = NULL` (historia insuficiente para calcular)
+- `baseline = NULL` (sin datos de comparación)
+
+### ¿Cómo interpreto un z-score de -2.5?
+
+Un z-score de -2.5 significa que el valor actual está 2.5 desviaciones estándar **por debajo** del baseline. En una distribución normal:
+- ~99% de los valores históricos estaban por encima de este nivel
+- Es un evento muy inusual (probabilidad ~0.6%)
+
+Para Alert 4 (Short Call Spike), un z-score **positivo** de +2.5 sería igualmente preocupante.
+
+### ¿Por qué los umbrales son -2.0 y -2.5?
+
+Basado en propiedades de la distribución normal:
+- **z = ±2.0:** ~95% de valores caen dentro de este rango → 5% de falsos positivos esperados
+- **z = ±2.5:** ~99% de valores caen dentro de este rango → 1% de falsos positivos esperados
+
+Estos umbrales balancean sensibilidad (detectar problemas reales) con especificidad (evitar falsas alarmas).
+
+### ¿Qué hago si una organización siempre aparece en INSUFFICIENT_DATA?
+
+**Opciones:**
+1. **Esperar:** Si es una organización nueva, necesita acumular historial
+2. **Reducir umbrales:** Si tiene bajo volumen permanente, considerar umbrales personalizados
+3. **Agrupar:** Combinar con otras organizaciones similares para aumentar muestra
+
+---
+
+## 7.3 Changelog
+
+| Versión | Fecha | Cambios |
+|---------|-------|---------|
+| 2.0 | Diciembre 2025 | Documentación técnica completa. Incluye las 5 alertas, 15 sub-alerts, charts, y métricas. |
+| 1.0 | - | Versión inicial del sistema de alertas |
+
+---
+
+## 7.4 Estructura de Archivos del Repositorio
+
+```
+dashboards/alerts/
+│
+├── ALERTS_DOCUMENTATION.md          # Documentación original (referencia)
+├── ALERTS_EXECUTIVE_SUMMARY.md      # Resumen ejecutivo (no técnico)
+├── ALERTS_TECHNICAL_DOCUMENTATION.md # Esta documentación
+│
+└── queries/
+    │
+    ├── charts/                       # Tab 1: Visualización
+    │   ├── total_calls.sql
+    │   ├── total_calls_all_orgs.sql
+    │   └── completed_calls.sql
+    │
+    ├── alerts/                       # Tab 2: Alertas
+    │   ├── alert_1_volume_drop.sql
+    │   ├── alert_2_completion_rate_drop.sql
+    │   ├── alert_3_quality_rate_drop.sql
+    │   ├── alert_4_short_call_rate_spike.sql
+    │   ├── alert_5_call_duration_anomaly.sql
+    │   │
+    │   └── sub_alerts/
+    │       ├── sub_alert_11_dod.sql
+    │       ├── sub_alert_12_wow.sql
+    │       ├── sub_alert_13_30davg.sql
+    │       ├── sub_alert_21_dod.sql
+    │       ├── sub_alert_22_wow.sql
+    │       ├── sub_alert_23_30davg.sql
+    │       ├── sub_alert_31_dod.sql
+    │       ├── sub_alert_32_wow.sql
+    │       ├── sub_alert_33_30davg.sql
+    │       ├── sub_alert_41_dod.sql
+    │       ├── sub_alert_42_wow.sql
+    │       ├── sub_alert_43_30davg.sql
+    │       ├── sub_alert_51_dod.sql
+    │       ├── sub_alert_52_wow.sql
+    │       └── sub_alert_53_30davg.sql
+    │
+    └── metrics/                      # Tab 3: Métricas
+        ├── current_summary/
+        │   ├── current_summary_alert_1.sql
+        │   ├── current_summary_alert_2.sql
+        │   ├── current_summary_alert_3.sql
+        │   ├── current_summary_alert_4.sql
+        │   └── current_summary_alert_5.sql
+        │
+        └── hourly_summary/
+            ├── hourly_summary_alert_1.sql
+            ├── hourly_summary_alert_2.sql
+            ├── hourly_summary_alert_3.sql
+            ├── hourly_summary_alert_4.sql
+            └── hourly_summary_alert_5.sql
+```
+
+---
+
+*Fin de la documentación*
