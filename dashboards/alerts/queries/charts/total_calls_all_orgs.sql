@@ -1,19 +1,8 @@
--- ==============================================================================
--- View 9: Daily-Hourly Blocks (Optimizado para barras apiladas con hora actual)
--- ==============================================================================
--- Muestra la distribución de llamadas por día y hora
--- Incluye marcador visual para la hora actual del día de hoy
--- 
--- VISUALIZACIÓN EN METABASE:
--- Tipo: "Stacked Bar Chart"
--- X axis: created_date (cada día es una barra)
--- Breakout: hour_of_day (cada hora es un bloque dentro de la barra)
--- Y axis: total_calls (altura del bloque)
--- ==============================================================================
-
 WITH hourly_data AS (
   SELECT
     created_date,
+	country,
+  	organization_name,
     hour_of_day,
     COUNT(*) AS total_calls,
     
@@ -50,13 +39,15 @@ WITH hourly_data AS (
   WHERE
     TRUE
     [[AND {{time}}]]
-    [[AND {{organization_name}}]]
+	
     [[AND {{countries}}]]
-  GROUP BY created_date, hour_of_day
+  GROUP BY created_date, hour_of_day, country, organization_name
 )
 
 SELECT
   created_date,
+  organization_name,
+  country,
   hour_of_day,
   total_calls,
   block_status,
@@ -78,4 +69,3 @@ SELECT
 
 FROM hourly_data
 ORDER BY created_date, hour_of_day;
-

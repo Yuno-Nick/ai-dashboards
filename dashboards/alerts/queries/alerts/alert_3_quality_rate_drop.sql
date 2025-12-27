@@ -1,20 +1,22 @@
 -- ==============================================================================
--- Alert 5: Call Duration Anomaly - MAIN ALERT
+-- Alert 3: Quality Rate Drop - MAIN ALERT
 -- ==============================================================================
 -- Este es el ALERT PRINCIPAL que solo se dispara cuando los 3 sub-alerts
 -- están en WARNING o CRITICAL simultáneamente.
 -- 
--- Métrica: avg_call_duration_seconds
--- Dirección: BIDIRECCIONAL (anomalías tanto cortas como largas)
+-- Métrica: quality_rate = good_calls / completed_calls
+-- (De las llamadas completadas, ¿cuántas fueron conversaciones efectivas?)
+--
+-- Dirección: Lower is bad
 --
 -- Sub-alerts:
---   5.1: vs DoD (ayer mismo momento) - usa stddev_all_days
---   5.2: vs WoW (semana pasada mismo día/momento) - usa stddev_same_weekday
---   5.3: vs 30d Avg (promedio 30 días mismo weekday) - usa stddev_same_weekday
+--   3.1: vs DoD (ayer mismo momento) - usa stddev_all_days
+--   3.2: vs WoW (semana pasada mismo día/momento) - usa stddev_same_weekday
+--   3.3: vs 30d Avg (promedio 30 días mismo weekday) - usa stddev_same_weekday
 --
--- Esta alerta detecta ANOMALÍAS EN LA DURACIÓN DE LLAMADAS.
--- TOO_SHORT: problemas de audio, hang-ups prematuros
--- TOO_LONG: loops en el agente, conversaciones sin cierre
+-- Esta alerta detecta CAÍDAS DE CALIDAD DE CONVERSACIÓN.
+-- Para problemas de CONEXIÓN (completion rate), ver Alert 6.
+-- Para problemas de VOLUMEN, ver Alert 3.
 -- ==============================================================================
 
 WITH current_time_parts AS (
@@ -33,14 +35,19 @@ today_metrics AS (
         COUNT(*) AS total_calls,
         SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') 
                  THEN 1 ELSE 0 END) AS completed_calls,
+        SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS good_calls,
+        SUM(CASE WHEN call_classification = 'short_calls' THEN 1 ELSE 0 END) AS short_calls,
         
-        ROUND(AVG(call_duration_seconds), 2) AS avg_duration_seconds
+        ROUND(
+            CAST(SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
+            NULLIF(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') 
+                            THEN 1 ELSE 0 END), 0),
+            4
+        ) AS quality_rate
         
     FROM ai_calls_detail, current_time_parts ctp
     WHERE 
         created_date = CURRENT_DATE()
-        AND call_classification IN ('good_calls', 'short_calls', 'completed')
-        AND call_duration_seconds IS NOT NULL
         AND (
             EXTRACT(HOUR FROM created_at) < ctp.current_hour
             OR (
@@ -58,13 +65,17 @@ yesterday_metrics AS (
         COUNT(*) AS total_calls,
         SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') 
                  THEN 1 ELSE 0 END) AS completed_calls,
-        ROUND(AVG(call_duration_seconds), 2) AS avg_duration_seconds
+        SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS good_calls,
+        ROUND(
+            CAST(SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
+            NULLIF(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') 
+                            THEN 1 ELSE 0 END), 0),
+            4
+        ) AS quality_rate
         
     FROM ai_calls_detail, current_time_parts ctp
     WHERE 
         created_date = CURRENT_DATE() - INTERVAL 1 DAY
-        AND call_classification IN ('good_calls', 'short_calls', 'completed')
-        AND call_duration_seconds IS NOT NULL
         AND (
             EXTRACT(HOUR FROM created_at) < ctp.current_hour
             OR (
@@ -82,13 +93,17 @@ lastweek_metrics AS (
         COUNT(*) AS total_calls,
         SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') 
                  THEN 1 ELSE 0 END) AS completed_calls,
-        ROUND(AVG(call_duration_seconds), 2) AS avg_duration_seconds
+        SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS good_calls,
+        ROUND(
+            CAST(SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
+            NULLIF(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') 
+                            THEN 1 ELSE 0 END), 0),
+            4
+        ) AS quality_rate
         
     FROM ai_calls_detail, current_time_parts ctp
     WHERE 
         created_date = CURRENT_DATE() - INTERVAL 7 DAY
-        AND call_classification IN ('good_calls', 'short_calls', 'completed')
-        AND call_duration_seconds IS NOT NULL
         AND (
             EXTRACT(HOUR FROM created_at) < ctp.current_hour
             OR (
@@ -105,19 +120,22 @@ stddev_all_days AS (
         organization_code,
         country,
         COUNT(DISTINCT created_date) AS sample_size,
-        ROUND(STDDEV(daily_avg_duration), 2) AS stddev_duration
+        ROUND(STDDEV(daily_quality_rate), 4) AS stddev_quality_rate
     FROM (
         SELECT
             d.organization_code,
             d.country,
             d.created_date,
-            ROUND(AVG(d.call_duration_seconds), 2) AS daily_avg_duration
+            ROUND(
+                CAST(SUM(CASE WHEN d.call_classification = 'good_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
+                NULLIF(SUM(CASE WHEN d.call_classification IN ('good_calls', 'short_calls', 'completed') 
+                                THEN 1 ELSE 0 END), 0),
+                4
+            ) AS daily_quality_rate
         FROM ai_calls_detail d, current_time_parts ctp
         WHERE 
             d.created_date >= CURRENT_DATE() - INTERVAL 30 DAY
             AND d.created_date < CURRENT_DATE()
-            AND d.call_classification IN ('good_calls', 'short_calls', 'completed')
-            AND d.call_duration_seconds IS NOT NULL
             AND (
                 EXTRACT(HOUR FROM d.created_at) < ctp.current_hour
                 OR (
@@ -126,7 +144,8 @@ stddev_all_days AS (
                 )
             )
         GROUP BY d.organization_code, d.country, d.created_date
-        HAVING COUNT(*) >= 30
+        HAVING SUM(CASE WHEN d.call_classification IN ('good_calls', 'short_calls', 'completed') 
+                        THEN 1 ELSE 0 END) >= 30
     ) daily_stats
     GROUP BY organization_code, country
 ),
@@ -139,8 +158,9 @@ stddev_same_weekday AS (
         COUNT(DISTINCT created_date) AS sample_size,
         ROUND(AVG(daily_total_calls), 0) AS avg_total_calls,
         ROUND(AVG(daily_completed_calls), 0) AS avg_completed_calls,
-        ROUND(AVG(daily_avg_duration), 2) AS avg_duration,
-        ROUND(STDDEV(daily_avg_duration), 2) AS stddev_duration
+        ROUND(AVG(daily_good_calls), 0) AS avg_good_calls,
+        ROUND(AVG(daily_quality_rate), 4) AS avg_quality_rate,
+        ROUND(STDDEV(daily_quality_rate), 4) AS stddev_quality_rate
     FROM (
         SELECT
             d.organization_code,
@@ -149,14 +169,18 @@ stddev_same_weekday AS (
             COUNT(*) AS daily_total_calls,
             SUM(CASE WHEN d.call_classification IN ('good_calls', 'short_calls', 'completed') 
                      THEN 1 ELSE 0 END) AS daily_completed_calls,
-            ROUND(AVG(d.call_duration_seconds), 2) AS daily_avg_duration
+            SUM(CASE WHEN d.call_classification = 'good_calls' THEN 1 ELSE 0 END) AS daily_good_calls,
+            ROUND(
+                CAST(SUM(CASE WHEN d.call_classification = 'good_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
+                NULLIF(SUM(CASE WHEN d.call_classification IN ('good_calls', 'short_calls', 'completed') 
+                                THEN 1 ELSE 0 END), 0),
+                4
+            ) AS daily_quality_rate
         FROM ai_calls_detail d, current_time_parts ctp
         WHERE 
             d.created_date >= CURRENT_DATE() - INTERVAL 30 DAY
             AND d.created_date < CURRENT_DATE()
             AND DAYOFWEEK(d.created_date) = DAYOFWEEK(CURRENT_DATE())
-            AND d.call_classification IN ('good_calls', 'short_calls', 'completed')
-            AND d.call_duration_seconds IS NOT NULL
             AND (
                 EXTRACT(HOUR FROM d.created_at) < ctp.current_hour
                 OR (
@@ -165,7 +189,8 @@ stddev_same_weekday AS (
                 )
             )
         GROUP BY d.organization_code, d.country, d.created_date
-        HAVING COUNT(*) >= 30
+        HAVING SUM(CASE WHEN d.call_classification IN ('good_calls', 'short_calls', 'completed') 
+                        THEN 1 ELSE 0 END) >= 30
     ) daily_stats
     GROUP BY organization_code, country
 ),
@@ -176,52 +201,58 @@ subalert_calculations AS (
         t.organization_name,
         t.country,
         
+        -- Métricas actuales
         t.total_calls AS current_total_calls,
         t.completed_calls AS current_completed_calls,
-        t.avg_duration_seconds AS current_avg_duration,
+        t.good_calls AS current_good_calls,
+        t.short_calls AS current_short_calls,
+        t.quality_rate AS current_quality_rate,
         
-        -- Baseline 1: DoD (ayer)
+        -- Baseline 1: DoD (ayer) - usa stddev_all_days
         y.total_calls AS baseline_dod_total,
         y.completed_calls AS baseline_dod_completed,
-        y.avg_duration_seconds AS baseline_dod_duration,
-        sad.stddev_duration AS stddev_all_days,
+        y.good_calls AS baseline_dod_good,
+        y.quality_rate AS baseline_dod_rate,
+        sad.stddev_quality_rate AS stddev_all_days,
         sad.sample_size AS sample_size_all_days,
         CASE 
-            WHEN sad.stddev_duration IS NULL OR sad.stddev_duration = 0 THEN NULL
-            ELSE ROUND((t.avg_duration_seconds - y.avg_duration_seconds) / sad.stddev_duration, 2)
+            WHEN sad.stddev_quality_rate IS NULL OR sad.stddev_quality_rate = 0 THEN NULL
+            ELSE ROUND((t.quality_rate - y.quality_rate) / sad.stddev_quality_rate, 2)
         END AS z_score_dod,
         CASE 
-            WHEN y.avg_duration_seconds IS NULL THEN NULL
-            ELSE ROUND(t.avg_duration_seconds - y.avg_duration_seconds, 1)
-        END AS seconds_change_dod,
+            WHEN y.quality_rate IS NULL THEN NULL
+            ELSE ROUND((t.quality_rate - y.quality_rate) * 100, 1)
+        END AS pp_change_dod,
         
-        -- Baseline 2: WoW (semana pasada)
+        -- Baseline 2: WoW (semana pasada) - usa stddev_same_weekday
         lw.total_calls AS baseline_wow_total,
         lw.completed_calls AS baseline_wow_completed,
-        lw.avg_duration_seconds AS baseline_wow_duration,
-        ssw.stddev_duration AS stddev_same_weekday,
+        lw.good_calls AS baseline_wow_good,
+        lw.quality_rate AS baseline_wow_rate,
+        ssw.stddev_quality_rate AS stddev_same_weekday,
         ssw.sample_size AS sample_size_weekday,
         CASE 
-            WHEN ssw.stddev_duration IS NULL OR ssw.stddev_duration = 0 THEN NULL
-            ELSE ROUND((t.avg_duration_seconds - lw.avg_duration_seconds) / ssw.stddev_duration, 2)
+            WHEN ssw.stddev_quality_rate IS NULL OR ssw.stddev_quality_rate = 0 THEN NULL
+            ELSE ROUND((t.quality_rate - lw.quality_rate) / ssw.stddev_quality_rate, 2)
         END AS z_score_wow,
         CASE 
-            WHEN lw.avg_duration_seconds IS NULL THEN NULL
-            ELSE ROUND(t.avg_duration_seconds - lw.avg_duration_seconds, 1)
-        END AS seconds_change_wow,
+            WHEN lw.quality_rate IS NULL THEN NULL
+            ELSE ROUND((t.quality_rate - lw.quality_rate) * 100, 1)
+        END AS pp_change_wow,
         
-        -- Baseline 3: 30d Avg (mismo día de semana)
+        -- Baseline 3: 30d Avg (mismo día de semana) - usa stddev_same_weekday
         ssw.avg_total_calls AS baseline_30d_total,
         ssw.avg_completed_calls AS baseline_30d_completed,
-        ssw.avg_duration AS baseline_30d_duration,
+        ssw.avg_good_calls AS baseline_30d_good,
+        ssw.avg_quality_rate AS baseline_30d_rate,
         CASE 
-            WHEN ssw.stddev_duration IS NULL OR ssw.stddev_duration = 0 THEN NULL
-            ELSE ROUND((t.avg_duration_seconds - ssw.avg_duration) / ssw.stddev_duration, 2)
+            WHEN ssw.stddev_quality_rate IS NULL OR ssw.stddev_quality_rate = 0 THEN NULL
+            ELSE ROUND((t.quality_rate - ssw.avg_quality_rate) / ssw.stddev_quality_rate, 2)
         END AS z_score_30d,
         CASE 
-            WHEN ssw.avg_duration IS NULL THEN NULL
-            ELSE ROUND(t.avg_duration_seconds - ssw.avg_duration, 1)
-        END AS seconds_change_30d
+            WHEN ssw.avg_quality_rate IS NULL THEN NULL
+            ELSE ROUND((t.quality_rate - ssw.avg_quality_rate) * 100, 1)
+        END AS pp_change_30d
         
     FROM today_metrics t
     LEFT JOIN yesterday_metrics y
@@ -242,43 +273,36 @@ subalert_severities AS (
     SELECT
         *,
         
-        -- Tipo de anomalía (consistente entre los 3)
-        CASE 
-            WHEN COALESCE(z_score_dod, 0) + COALESCE(z_score_wow, 0) + COALESCE(z_score_30d, 0) > 0 
-            THEN 'TOO_LONG'
-            ELSE 'TOO_SHORT'
-        END AS anomaly_type,
-        
-        -- Severidad Sub-alert 5.1 (DoD) - BIDIRECCIONAL
+        -- Severidad Sub-alert 7.1 (DoD) - usa stddev_all_days
         CASE
             WHEN current_completed_calls < 30 THEN 'INSUFFICIENT_DATA'
-            WHEN baseline_dod_duration IS NULL OR baseline_dod_completed < 30 THEN 'INSUFFICIENT_DATA'
+            WHEN baseline_dod_rate IS NULL OR baseline_dod_completed < 30 THEN 'INSUFFICIENT_DATA'
             WHEN stddev_all_days IS NULL OR stddev_all_days = 0 THEN 'INSUFFICIENT_DATA'
             WHEN sample_size_all_days < 10 THEN 'INSUFFICIENT_DATA'
-            WHEN ABS(z_score_dod) > 2.5 THEN 'CRITICAL'
-            WHEN ABS(z_score_dod) > 2.0 THEN 'WARNING'
+            WHEN z_score_dod < -2.5 THEN 'CRITICAL'
+            WHEN z_score_dod < -2.0 THEN 'WARNING'
             ELSE 'FINE'
         END AS severity_dod,
         
-        -- Severidad Sub-alert 5.2 (WoW) - BIDIRECCIONAL
+        -- Severidad Sub-alert 7.2 (WoW) - usa stddev_same_weekday
         CASE
             WHEN current_completed_calls < 30 THEN 'INSUFFICIENT_DATA'
-            WHEN baseline_wow_duration IS NULL OR baseline_wow_completed < 30 THEN 'INSUFFICIENT_DATA'
+            WHEN baseline_wow_rate IS NULL OR baseline_wow_completed < 30 THEN 'INSUFFICIENT_DATA'
             WHEN stddev_same_weekday IS NULL OR stddev_same_weekday = 0 THEN 'INSUFFICIENT_DATA'
             WHEN sample_size_weekday < 3 THEN 'INSUFFICIENT_DATA'
-            WHEN ABS(z_score_wow) > 2.5 THEN 'CRITICAL'
-            WHEN ABS(z_score_wow) > 2.0 THEN 'WARNING'
+            WHEN z_score_wow < -2.5 THEN 'CRITICAL'
+            WHEN z_score_wow < -2.0 THEN 'WARNING'
             ELSE 'FINE'
         END AS severity_wow,
         
-        -- Severidad Sub-alert 5.3 (30d Avg) - BIDIRECCIONAL
+        -- Severidad Sub-alert 7.3 (30d Avg) - usa stddev_same_weekday
         CASE
             WHEN current_completed_calls < 30 THEN 'INSUFFICIENT_DATA'
-            WHEN baseline_30d_duration IS NULL THEN 'INSUFFICIENT_DATA'
+            WHEN baseline_30d_rate IS NULL THEN 'INSUFFICIENT_DATA'
             WHEN stddev_same_weekday IS NULL OR stddev_same_weekday = 0 THEN 'INSUFFICIENT_DATA'
             WHEN sample_size_weekday < 3 THEN 'INSUFFICIENT_DATA'
-            WHEN ABS(z_score_30d) > 2.5 THEN 'CRITICAL'
-            WHEN ABS(z_score_30d) > 2.0 THEN 'WARNING'
+            WHEN z_score_30d < -2.5 THEN 'CRITICAL'
+            WHEN z_score_30d < -2.0 THEN 'WARNING'
             ELSE 'FINE'
         END AS severity_30d
         
@@ -308,49 +332,31 @@ main_alert AS (
 
 SELECT
     CASE
-        WHEN main_severity = 'CRITICAL' AND anomaly_type = 'TOO_SHORT' THEN
+        WHEN main_severity = 'CRITICAL' THEN
             CONCAT(
-                '🔴 CRITICAL: ', organization_name, ' (', country, ') - DURACIÓN ANORMALMENTE CORTA CONFIRMADA. ',
-                'Duración actual: ', CAST(current_avg_duration AS VARCHAR), 's promedio. ',
-                '▼ vs Ayer: ', CAST(baseline_dod_duration AS VARCHAR), 's → ', 
-                CAST(seconds_change_dod AS VARCHAR), 's. ',
-                '▼ vs Semana pasada: ', CAST(baseline_wow_duration AS VARCHAR), 's → ', 
-                CAST(seconds_change_wow AS VARCHAR), 's. ',
-                '▼ vs Promedio 30d: ', CAST(baseline_30d_duration AS VARCHAR), 's → ', 
-                CAST(seconds_change_30d AS VARCHAR), 's. ',
-                'ACCIÓN REQUERIDA: Revisar calidad de audio, comportamiento inicial del agente, y tasas de hang-up.'
+                '🔴 CRITICAL: ', organization_name, ' (', country, ') - CAÍDA DE CALIDAD DE CONVERSACIÓN CONFIRMADA. ',
+                'Quality rate actual: ', CAST(ROUND(current_quality_rate * 100, 1) AS VARCHAR), '% (',
+                CAST(current_good_calls AS VARCHAR), '/', CAST(current_completed_calls AS VARCHAR), ' good/completed). ',
+                '▼ vs Ayer: ', CAST(ROUND(baseline_dod_rate * 100, 1) AS VARCHAR), '% (',
+                CAST(baseline_dod_good AS VARCHAR), '/', CAST(baseline_dod_completed AS VARCHAR), ') → ', 
+                CAST(pp_change_dod AS VARCHAR), ' pp. ',
+                '▼ vs Semana pasada: ', CAST(ROUND(baseline_wow_rate * 100, 1) AS VARCHAR), '% (',
+                CAST(baseline_wow_good AS VARCHAR), '/', CAST(baseline_wow_completed AS VARCHAR), ') → ', 
+                CAST(pp_change_wow AS VARCHAR), ' pp. ',
+                '▼ vs Promedio 30d: ', CAST(ROUND(baseline_30d_rate * 100, 1) AS VARCHAR), '% (~',
+                CAST(baseline_30d_good AS VARCHAR), '/', CAST(baseline_30d_completed AS VARCHAR), ') → ', 
+                CAST(pp_change_30d AS VARCHAR), ' pp. ',
+                'ACCIÓN REQUERIDA: Revisar script del agente AI, prompts y flujo de conversación.'
             )
         
-        WHEN main_severity = 'CRITICAL' AND anomaly_type = 'TOO_LONG' THEN
+        WHEN main_severity = 'WARNING' THEN
             CONCAT(
-                '🔴 CRITICAL: ', organization_name, ' (', country, ') - DURACIÓN ANORMALMENTE LARGA CONFIRMADA. ',
-                'Duración actual: ', CAST(current_avg_duration AS VARCHAR), 's promedio. ',
-                '▲ vs Ayer: ', CAST(baseline_dod_duration AS VARCHAR), 's → +', 
-                CAST(seconds_change_dod AS VARCHAR), 's. ',
-                '▲ vs Semana pasada: ', CAST(baseline_wow_duration AS VARCHAR), 's → +', 
-                CAST(seconds_change_wow AS VARCHAR), 's. ',
-                '▲ vs Promedio 30d: ', CAST(baseline_30d_duration AS VARCHAR), 's → +', 
-                CAST(seconds_change_30d AS VARCHAR), 's. ',
-                'ACCIÓN REQUERIDA: Revisar posibles loops en el agente, conversaciones sin cierre, o bugs en el flujo.'
-            )
-        
-        WHEN main_severity = 'WARNING' AND anomaly_type = 'TOO_SHORT' THEN
-            CONCAT(
-                '🟠 WARNING: ', organization_name, ' (', country, ') - Duración más corta en todas las comparaciones. ',
-                'Duración actual: ', CAST(current_avg_duration AS VARCHAR), 's. ',
-                'Comparaciones: Ayer ', CAST(baseline_dod_duration AS VARCHAR), 's (', CAST(seconds_change_dod AS VARCHAR), 's) | ',
-                'Semana pasada ', CAST(baseline_wow_duration AS VARCHAR), 's (', CAST(seconds_change_wow AS VARCHAR), 's) | ',
-                'Promedio 30d ', CAST(baseline_30d_duration AS VARCHAR), 's (', CAST(seconds_change_30d AS VARCHAR), 's). ',
-                'Monitorear de cerca.'
-            )
-        
-        WHEN main_severity = 'WARNING' AND anomaly_type = 'TOO_LONG' THEN
-            CONCAT(
-                '🟠 WARNING: ', organization_name, ' (', country, ') - Duración más larga en todas las comparaciones. ',
-                'Duración actual: ', CAST(current_avg_duration AS VARCHAR), 's. ',
-                'Comparaciones: Ayer ', CAST(baseline_dod_duration AS VARCHAR), 's (+', CAST(seconds_change_dod AS VARCHAR), 's) | ',
-                'Semana pasada ', CAST(baseline_wow_duration AS VARCHAR), 's (+', CAST(seconds_change_wow AS VARCHAR), 's) | ',
-                'Promedio 30d ', CAST(baseline_30d_duration AS VARCHAR), 's (+', CAST(seconds_change_30d AS VARCHAR), 's). ',
+                '🟠 WARNING: ', organization_name, ' (', country, ') - Quality rate bajo en todas las comparaciones. ',
+                'Rate actual: ', CAST(ROUND(current_quality_rate * 100, 1) AS VARCHAR), '% (',
+                CAST(current_good_calls AS VARCHAR), '/', CAST(current_completed_calls AS VARCHAR), '). ',
+                'Comparaciones: Ayer ', CAST(ROUND(baseline_dod_rate * 100, 1) AS VARCHAR), '% (', CAST(pp_change_dod AS VARCHAR), ' pp) | ',
+                'Semana pasada ', CAST(ROUND(baseline_wow_rate * 100, 1) AS VARCHAR), '% (', CAST(pp_change_wow AS VARCHAR), ' pp) | ',
+                'Promedio 30d ', CAST(ROUND(baseline_30d_rate * 100, 1) AS VARCHAR), '% (', CAST(pp_change_30d AS VARCHAR), ' pp). ',
                 'Monitorear de cerca.'
             )
         
@@ -365,4 +371,4 @@ ORDER BY
         WHEN 'WARNING' THEN 2 
         ELSE 3 
     END,
-    GREATEST(ABS(COALESCE(z_score_dod, 0)), ABS(COALESCE(z_score_wow, 0)), ABS(COALESCE(z_score_30d, 0))) DESC
+    LEAST(COALESCE(z_score_dod, 0), COALESCE(z_score_wow, 0), COALESCE(z_score_30d, 0)) ASC
