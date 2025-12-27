@@ -1,0 +1,6 @@
+# Ignorar carpetas de contexto y datos que no se deben subir
+context/
+no_subir/
+
+# Ignorar carpeta de datos de muestra
+dashboards/alerts/queries/sample_data/
