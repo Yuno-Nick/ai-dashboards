@@ -1,212 +1,45 @@
 -- ==============================================================================
--- Alert 2 - METRICS VIEW: Daily Quality Metrics (Informativa sin filtros)
+-- HOURLY ALERT 2: Completion Rate (Historical - Last 7 days by hour)
 -- ==============================================================================
--- Muestra métricas de calidad comparando:
--- 1. Hoy vs ayer (hasta hora actual)
--- 2. Hoy vs promedio de TODOS los últimos 30 días (sin filtrar por día de semana)
--- 
--- Esta es la vista informativa completa, sin filtros de alerta.
--- Útil para monitoreo y análisis de tendencias.
+-- Metric: completion_rate = completed_calls / total_calls | Direction: LOWER is bad
 -- ==============================================================================
 
-WITH today_stats AS (
-  SELECT
-    organization_code,
-    organization_name,
-    country,
-    
-    COUNT(*) AS total_calls,
-    SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
-    SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS good_calls,
-    SUM(CASE WHEN call_classification = 'short_calls' THEN 1 ELSE 0 END) AS short_calls,
-    SUM(call_duration_minutes) AS total_minutes,
-    
-    ROUND(
-      CAST(SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
-      NULLIF(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END), 0),
-      4
-    ) AS quality_rate
-    
-  FROM ai_calls_detail
-  WHERE 
-    created_date = CURRENT_DATE()
-    AND created_at < CURRENT_TIMESTAMP()
-    [[AND {{organization_name}}]]
-    [[AND {{countries}}]]
-  GROUP BY organization_code, organization_name, country
-),
-
-yesterday_stats AS (
-  SELECT
-    organization_code,
-    organization_name,
-    country,
-    
-    COUNT(*) AS total_calls,
-    SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
-    SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS good_calls,
-    SUM(CASE WHEN call_classification = 'short_calls' THEN 1 ELSE 0 END) AS short_calls,
-    SUM(call_duration_minutes) AS total_minutes,
-    
-    ROUND(
-      CAST(SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
-      NULLIF(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END), 0),
-      4
-    ) AS quality_rate
-    
-  FROM ai_calls_detail
-  WHERE 
-    created_date = CURRENT_DATE() - INTERVAL 1 DAY
-    AND created_at < CURRENT_TIMESTAMP() - INTERVAL 1 DAY
-    [[AND {{organization_name}}]]
-    [[AND {{countries}}]]
-  GROUP BY organization_code, organization_name, country
-),
-
--- Promedio de quality_rate de TODOS los días hasta la hora actual (últimos 30 días)
-baseline_30d_avg AS (
-  SELECT
-    organization_code,
-    organization_name,
-    country,
-    
-    -- Promedio de quality_rate de todos los días hasta la hora actual
-    ROUND(AVG(daily_quality_rate), 4) AS avg_quality_rate_30d,
-    
-    -- Número de días con data
-    COUNT(DISTINCT created_date) AS days_with_data
-    
-  FROM (
-    SELECT
-      organization_code,
-      organization_name,
-      country,
-      created_date,
-      -- Calcular quality_rate por día hasta la hora actual
-      ROUND(
-        CAST(SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
-        NULLIF(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END), 0),
-        4
-      ) AS daily_quality_rate
+WITH hourly_metrics AS (
+    SELECT created_hour AS eval_hour, created_date AS eval_date, EXTRACT(HOUR FROM created_hour) AS hour_of_day, DAYOFWEEK(created_date) AS day_of_week,
+        organization_code, organization_name, country, COUNT(*) AS total_calls,
+        SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
+        ROUND(CAST(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS FLOAT) / NULLIF(COUNT(*), 0), 4) AS completion_rate
     FROM ai_calls_detail
-    WHERE 
-      created_date >= CURRENT_DATE() - INTERVAL 30 DAY
-      AND created_date < CURRENT_DATE()
-      -- Solo llamadas hasta la misma hora del día (sin filtrar por día de semana)
-      AND (
-        EXTRACT(HOUR FROM created_at) < EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
-        OR (
-          EXTRACT(HOUR FROM created_at) = EXTRACT(HOUR FROM CURRENT_TIMESTAMP())
-          AND EXTRACT(MINUTE FROM created_at) <= EXTRACT(MINUTE FROM CURRENT_TIMESTAMP())
-        )
-      )
-      [[AND {{organization_name}}]]
-      [[AND {{countries}}]]
-    GROUP BY organization_code, organization_name, country, created_date
-    HAVING SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) >= 10
-  ) daily_stats
-  GROUP BY organization_code, organization_name, country
+    WHERE created_date >= CURRENT_DATE() - INTERVAL 14 DAY AND created_hour < DATE_TRUNC('hour', CURRENT_TIMESTAMP())
+        [[AND {{organization_name}}]]
+        [[AND {{country}}]]
+    GROUP BY created_hour, created_date, organization_code, organization_name, country HAVING COUNT(*) >= 5
 ),
 
-daily_comparison AS (
-  SELECT
-    COALESCE(t.organization_code, y.organization_code, b.organization_code) AS organization_code,
-    COALESCE(t.organization_name, y.organization_name, b.organization_name) AS organization_name,
-    COALESCE(t.country, y.country, b.country) AS country,
-    
-    CURRENT_TIMESTAMP() AS alert_timestamp,
-    
-    -- Today's metrics
-    COALESCE(t.total_calls, 0) AS today_total_calls,
-    COALESCE(t.completed_calls, 0) AS today_completed_calls,
-    COALESCE(t.good_calls, 0) AS today_good_calls,
-    COALESCE(t.short_calls, 0) AS today_short_calls,
-    COALESCE(t.total_minutes, 0) AS today_total_minutes,
-    COALESCE(t.quality_rate, 0) AS today_quality_rate,
-    
-    -- Yesterday's metrics
-    COALESCE(y.total_calls, 0) AS yesterday_total_calls,
-    COALESCE(y.completed_calls, 0) AS yesterday_completed_calls,
-    COALESCE(y.good_calls, 0) AS yesterday_good_calls,
-    COALESCE(y.short_calls, 0) AS yesterday_short_calls,
-    COALESCE(y.total_minutes, 0) AS yesterday_total_minutes,
-    COALESCE(y.quality_rate, 0) AS yesterday_quality_rate,
-    
-    -- Baseline 30 días (todos los días)
-    COALESCE(b.avg_quality_rate_30d, 0) AS baseline_30d_avg_quality,
-    COALESCE(b.days_with_data, 0) AS baseline_days_count,
-    
-    -- Ratio vs yesterday
-    ROUND(
-      COALESCE(t.quality_rate, 0) / NULLIF(y.quality_rate, 0),
-      4
-    ) AS quality_ratio_vs_yesterday,
-    
-    -- Ratio vs 30d baseline (mismo día de semana)
-    ROUND(
-      COALESCE(t.quality_rate, 0) / NULLIF(b.avg_quality_rate_30d, 0),
-      4
-    ) AS quality_ratio_vs_30d_avg,
-    
-    -- Severity determination (DUAL BASELINE: requiere AMBOS criterios)
-    CASE
-      -- Insufficient data
-      WHEN COALESCE(t.completed_calls, 0) < 50 
-        OR COALESCE(y.completed_calls, 0) < 50
-        OR COALESCE(b.days_with_data, 0) < 20
-        THEN 'INSUFFICIENT_DATA'
-      
-      -- Critical: Drop > 20% vs AMBOS baselines
-      WHEN COALESCE(t.quality_rate, 0) / NULLIF(y.quality_rate, 0) < 0.80
-        AND COALESCE(t.quality_rate, 0) / NULLIF(b.avg_quality_rate_30d, 0) < 0.80
-        THEN 'CRITICAL'
-      
-      -- Warning: Drop 10-20% vs AMBOS baselines
-      WHEN COALESCE(t.quality_rate, 0) / NULLIF(y.quality_rate, 0) < 0.90
-        AND COALESCE(t.quality_rate, 0) / NULLIF(b.avg_quality_rate_30d, 0) < 0.90
-        THEN 'WARNING'
-      
-      ELSE 'FINE'
-    END AS alert_severity
-    
-  FROM today_stats t
-  FULL OUTER JOIN yesterday_stats y
-    ON t.organization_code = y.organization_code
-    AND t.country = y.country
-  FULL OUTER JOIN baseline_30d_avg b
-    ON COALESCE(t.organization_code, y.organization_code) = b.organization_code
-    AND COALESCE(t.country, y.country) = b.country
-)
+display_metrics AS (SELECT * FROM hourly_metrics WHERE eval_date >= CURRENT_DATE() - INTERVAL 7 DAY),
+stddev_all_days AS (SELECT organization_code, country, hour_of_day, COUNT(DISTINCT eval_date) AS sample_size, ROUND(STDDEV(completion_rate), 4) AS stddev_value FROM hourly_metrics WHERE eval_date < CURRENT_DATE() GROUP BY organization_code, country, hour_of_day),
+stddev_same_weekday AS (SELECT organization_code, country, day_of_week, hour_of_day, COUNT(DISTINCT eval_date) AS sample_size, ROUND(AVG(completion_rate), 4) AS avg_value, ROUND(STDDEV(completion_rate), 4) AS stddev_value FROM hourly_metrics WHERE eval_date < CURRENT_DATE() GROUP BY organization_code, country, day_of_week, hour_of_day),
+baseline_dod AS (SELECT m.organization_code, m.country, m.hour_of_day, m.eval_date, d.completion_rate AS baseline_value FROM display_metrics m LEFT JOIN hourly_metrics d ON m.organization_code = d.organization_code AND m.country = d.country AND m.hour_of_day = d.hour_of_day AND m.eval_date = d.eval_date + INTERVAL 1 DAY),
+baseline_wow AS (SELECT m.organization_code, m.country, m.hour_of_day, m.eval_date, w.completion_rate AS baseline_value FROM display_metrics m LEFT JOIN hourly_metrics w ON m.organization_code = w.organization_code AND m.country = w.country AND m.hour_of_day = w.hour_of_day AND m.eval_date = w.eval_date + INTERVAL 7 DAY)
 
--- ==============================================================================
--- METRICS VIEW: Vista Informativa Completa (Sin filtros de alerta)
--- ==============================================================================
--- Muestra todas las organizaciones con sus métricas de calidad comparando:
--- - Today vs Yesterday
--- - Today vs 30-Day Average (all days)
--- 
--- Útil para monitoreo general, análisis de tendencias y detección temprana
--- ==============================================================================
-
-SELECT
-  alert_timestamp AS datetime,
-  organization_name,
-  country,
-  today_total_calls AS T_Calls,
-  yesterday_total_calls AS Y_Calls,
-  today_quality_rate AS T_rate,
-  yesterday_quality_rate AS Y_rate,
-  ROUND(baseline_30d_avg_quality, 4) AS 30D_AVG_rate,
-  quality_ratio_vs_yesterday AS T_v_Y_ratio,
-  quality_ratio_vs_30d_avg AS T_v_30D_ratio,
-  today_good_calls AS T_good_calls,
-  today_completed_calls AS T_completed_calls,
-  yesterday_good_calls AS Y_good_calls,
-  yesterday_completed_calls AS Y_completed_calls,
-  baseline_days_count AS 30D_days_count,
-  alert_severity
-FROM daily_comparison
-ORDER BY
-  alert_severity,
-  T_v_30D_ratio ASC,
-  organization_name;
+SELECT m.eval_hour,
+-- m.eval_date, m.hour_of_day,
+    -- CASE m.day_of_week WHEN 1 THEN 'Sunday' WHEN 2 THEN 'Monday' WHEN 3 THEN 'Tuesday' WHEN 4 THEN 'Wednesday' WHEN 5 THEN 'Thursday' WHEN 6 THEN 'Friday' WHEN 7 THEN 'Saturday' END AS day_name,
+    -- m.organization_code,
+	m.organization_name, m.country,
+    m.total_calls AS current_total_calls, m.completed_calls AS current_completed_calls, m.completion_rate AS current_completion_rate,
+    dod.baseline_value AS baseline_dod_completion_rate, ROUND((m.completion_rate - COALESCE(dod.baseline_value, 0)) * 100, 2) AS pp_change_dod,
+    CASE WHEN sad.stddev_value > 0 THEN ROUND((m.completion_rate - dod.baseline_value) / sad.stddev_value, 2) ELSE NULL END AS z_score_dod,
+    CASE WHEN dod.baseline_value IS NULL OR sad.sample_size < 5 THEN 'INSUFFICIENT_DATA' WHEN (m.completion_rate - dod.baseline_value) / NULLIF(sad.stddev_value, 0) < -2.5 THEN 'CRITICAL' WHEN (m.completion_rate - dod.baseline_value) / NULLIF(sad.stddev_value, 0) < -2.0 THEN 'WARNING' ELSE 'FINE' END AS severity_dod,
+    wow.baseline_value AS baseline_wow_completion_rate, ROUND((m.completion_rate - COALESCE(wow.baseline_value, 0)) * 100, 2) AS pp_change_wow,
+    CASE WHEN ssw.stddev_value > 0 THEN ROUND((m.completion_rate - wow.baseline_value) / ssw.stddev_value, 2) ELSE NULL END AS z_score_wow,
+    CASE WHEN wow.baseline_value IS NULL OR ssw.sample_size < 3 THEN 'INSUFFICIENT_DATA' WHEN (m.completion_rate - wow.baseline_value) / NULLIF(ssw.stddev_value, 0) < -2.5 THEN 'CRITICAL' WHEN (m.completion_rate - wow.baseline_value) / NULLIF(ssw.stddev_value, 0) < -2.0 THEN 'WARNING' ELSE 'FINE' END AS severity_wow,
+    ssw.avg_value AS baseline_30d_avg_completion_rate, ROUND((m.completion_rate - COALESCE(ssw.avg_value, 0)) * 100, 2) AS pp_change_30d,
+    CASE WHEN ssw.stddev_value > 0 THEN ROUND((m.completion_rate - ssw.avg_value) / ssw.stddev_value, 2) ELSE NULL END AS z_score_30d,
+    CASE WHEN ssw.avg_value IS NULL OR ssw.sample_size < 3 THEN 'INSUFFICIENT_DATA' WHEN (m.completion_rate - ssw.avg_value) / NULLIF(ssw.stddev_value, 0) < -2.5 THEN 'CRITICAL' WHEN (m.completion_rate - ssw.avg_value) / NULLIF(ssw.stddev_value, 0) < -2.0 THEN 'WARNING' ELSE 'FINE' END AS severity_30d
+FROM display_metrics m
+LEFT JOIN baseline_dod dod ON m.organization_code = dod.organization_code AND m.country = dod.country AND m.hour_of_day = dod.hour_of_day AND m.eval_date = dod.eval_date
+LEFT JOIN baseline_wow wow ON m.organization_code = wow.organization_code AND m.country = wow.country AND m.hour_of_day = wow.hour_of_day AND m.eval_date = wow.eval_date
+LEFT JOIN stddev_all_days sad ON m.organization_code = sad.organization_code AND m.country = sad.country AND m.hour_of_day = sad.hour_of_day
+LEFT JOIN stddev_same_weekday ssw ON m.organization_code = ssw.organization_code AND m.country = ssw.country AND m.day_of_week = ssw.day_of_week AND m.hour_of_day = ssw.hour_of_day
+ORDER BY  m.eval_hour DESC, m.organization_name, m.country
