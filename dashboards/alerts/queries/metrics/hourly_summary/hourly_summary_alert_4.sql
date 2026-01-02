@@ -1,134 +1,47 @@
 -- ==============================================================================
--- Alert 4 - METRICS VIEW: Short Call Rate Metrics (Informativa sin filtros)
+-- HOURLY ALERT 4: Short Call Rate (Historical - Last 7 days by hour)
 -- ==============================================================================
--- Muestra métricas de short call rate con detección estadística de anomalías
--- basada en los últimos 30 días.
--- 
--- PERIODO: Últimos 7 días desde CURRENT_DATE()
--- Esta es la vista informativa completa, sin filtros de alerta.
--- Útil para monitoreo general y análisis de tendencias.
+-- Metric: short_call_rate = short_calls / completed_calls | Direction: HIGHER is bad
 -- ==============================================================================
 
-WITH current_hour_metrics AS (
-  SELECT
-  created_hour,
-    organization_code,
-    organization_name,
-    country,
-    
-    -- Contar directamente de detail
-    COUNT(*) AS total_calls,
-    SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
-    SUM(CASE WHEN call_classification = 'good_calls' THEN 1 ELSE 0 END) AS good_calls,
-    SUM(CASE WHEN call_classification = 'short_calls' THEN 1 ELSE 0 END) AS short_calls,
-    
-    -- Short call rate calculado
-    ROUND(
-      CAST(SUM(CASE WHEN call_classification = 'short_calls' THEN 1 ELSE 0 END) AS FLOAT) / 
-      NULLIF(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END), 0),
-      4
-    ) AS short_call_rate,
-    
-    -- Average duration
-    ROUND(AVG(call_duration_seconds), 2) AS avg_call_duration_seconds
-        
-  FROM ai_calls_detail
-  WHERE 
-    created_date >= CURRENT_DATE() - INTERVAL 7 DAY  -- Últimos 7 días
-    [[AND {{organization_name}}]]
-    [[AND {{countries}}]]
-  GROUP BY created_hour, organization_code, organization_name, country
+WITH hourly_metrics AS (
+    SELECT created_hour AS eval_hour, created_date AS eval_date, EXTRACT(HOUR FROM created_hour) AS hour_of_day, DAYOFWEEK(created_date) AS day_of_week,
+        organization_code, organization_name, country,
+        SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) AS completed_calls,
+        SUM(CASE WHEN call_classification = 'short_calls' THEN 1 ELSE 0 END) AS short_calls,
+        ROUND(CAST(SUM(CASE WHEN call_classification = 'short_calls' THEN 1 ELSE 0 END) AS FLOAT) / NULLIF(SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END), 0), 4) AS short_call_rate
+    FROM ai_calls_detail
+    WHERE created_date >= CURRENT_DATE() - INTERVAL 14 DAY AND created_hour < DATE_TRUNC('hour', CURRENT_TIMESTAMP())
+        [[AND {{organization_name}}]]
+        [[AND {{country}}]]
+    GROUP BY created_hour, created_date, organization_code, organization_name, country
+    HAVING SUM(CASE WHEN call_classification IN ('good_calls', 'short_calls', 'completed') THEN 1 ELSE 0 END) >= 5
 ),
 
-anomaly_detection AS (
-  SELECT
-    curr.organization_code,
-    curr.organization_name,
-    curr.country,
-    
-    curr.created_hour AS alert_timestamp,
-    EXTRACT(HOUR FROM curr.created_hour) AS current_hour,
-    
-    -- Current metrics
-    curr.total_calls AS current_total_calls,
-    curr.completed_calls AS current_completed_calls,
-    curr.good_calls AS current_good_calls,
-    curr.short_calls AS current_short_calls,
-    curr.short_call_rate AS current_short_call_rate,
-    curr.avg_call_duration_seconds AS current_avg_duration,
-    
-    -- Baseline statistics (from last 30 days)
-    base.avg_short_call_rate_30d AS baseline_short_call_rate,
-    base.stddev_short_call_rate_30d AS baseline_stddev,
-    base.p50_short_call_rate_30d AS baseline_median,
-    base.p95_short_call_rate_30d AS baseline_p95,
-    base.short_call_rate_upper_threshold,
-    base.sample_size_30d AS baseline_sample_size,
-    
-    -- Deviation from baseline (in standard deviations)
-    CASE 
-      WHEN base.stddev_short_call_rate_30d > 0 
-      THEN ROUND(
-        (curr.short_call_rate - base.avg_short_call_rate_30d) / base.stddev_short_call_rate_30d,
-        2
-      )
-      ELSE 0
-    END AS sigma_deviation,
-    
-    -- Severity determination
-    CASE
-      -- Insufficient data
-      WHEN curr.completed_calls < 10 
-        OR base.sample_size_30d < 10
-        -- OR base.has_sufficient_baseline_data = FALSE
-        THEN 'INSUFFICIENT_DATA'
-      
-      -- Critical: > 3 standard deviations or > P95 by large margin
-      WHEN curr.short_call_rate > base.avg_short_call_rate_30d + 3 * base.stddev_short_call_rate_30d
-        OR (curr.short_call_rate > base.p95_short_call_rate_30d * 1.2 AND curr.short_calls >= 10)
-        THEN 'CRITICAL'
-      
-      -- Warning: > 2 standard deviations
-      WHEN curr.short_call_rate > base.avg_short_call_rate_30d + 2 * base.stddev_short_call_rate_30d
-        AND curr.short_calls >= 5
-        THEN 'WARNING'
-      
-      ELSE 'FINE'
-    END AS alert_severity
-    
-  FROM current_hour_metrics curr
-  INNER JOIN alerts_baseline_stats base
-    ON curr.organization_code = base.organization_code
-    AND curr.country = base.country
-    AND EXTRACT(HOUR FROM curr.created_hour) = base.hour_of_day
-)
+display_metrics AS (SELECT * FROM hourly_metrics WHERE eval_date >= CURRENT_DATE() - INTERVAL 7 DAY),
+stddev_all_days AS (SELECT organization_code, country, hour_of_day, COUNT(DISTINCT eval_date) AS sample_size, ROUND(STDDEV(short_call_rate), 4) AS stddev_value FROM hourly_metrics WHERE eval_date < CURRENT_DATE() GROUP BY organization_code, country, hour_of_day),
+stddev_same_weekday AS (SELECT organization_code, country, day_of_week, hour_of_day, COUNT(DISTINCT eval_date) AS sample_size, ROUND(AVG(short_call_rate), 4) AS avg_value, ROUND(STDDEV(short_call_rate), 4) AS stddev_value FROM hourly_metrics WHERE eval_date < CURRENT_DATE() GROUP BY organization_code, country, day_of_week, hour_of_day),
+baseline_dod AS (SELECT m.organization_code, m.country, m.hour_of_day, m.eval_date, d.short_call_rate AS baseline_value, d.short_calls AS baseline_short_calls FROM display_metrics m LEFT JOIN hourly_metrics d ON m.organization_code = d.organization_code AND m.country = d.country AND m.hour_of_day = d.hour_of_day AND m.eval_date = d.eval_date + INTERVAL 1 DAY),
+baseline_wow AS (SELECT m.organization_code, m.country, m.hour_of_day, m.eval_date, w.short_call_rate AS baseline_value, w.short_calls AS baseline_short_calls FROM display_metrics m LEFT JOIN hourly_metrics w ON m.organization_code = w.organization_code AND m.country = w.country AND m.hour_of_day = w.hour_of_day AND m.eval_date = w.eval_date + INTERVAL 7 DAY)
 
--- ==============================================================================
--- METRICS VIEW: Vista Informativa Completa (Sin filtros de alerta)
--- ==============================================================================
--- Muestra todas las organizaciones con sus métricas de short call rate
--- Útil para monitoreo general, análisis de tendencias y detección temprana
--- ==============================================================================
-
-SELECT
-  alert_timestamp AS datetime,
-  organization_name,
-  country,
-  current_total_calls AS T_Calls,
-  current_completed_calls AS T_completed_calls,
-  current_short_calls AS T_short_calls,
-  current_good_calls AS T_good_calls,
-  current_short_call_rate AS T_rate,
-  baseline_short_call_rate AS 30D_AVG_rate,
-  sigma_deviation,
-  baseline_sample_size AS 30D_sample_size,
-  current_hour,
-  alert_severity
-FROM anomaly_detection
--- WHERE
-  -- current_hour BETWEEN 6 AND 23  -- Operational hours only (6AM-11PM)
-ORDER BY
-  alert_severity,
-  sigma_deviation DESC,
-  organization_name;
-
+SELECT m.eval_hour,
+-- m.eval_date, m.hour_of_day,
+    -- CASE m.day_of_week WHEN 1 THEN 'Sunday' WHEN 2 THEN 'Monday' WHEN 3 THEN 'Tuesday' WHEN 4 THEN 'Wednesday' WHEN 5 THEN 'Thursday' WHEN 6 THEN 'Friday' WHEN 7 THEN 'Saturday' END AS day_name,
+    -- m.organization_code,
+	m.organization_name, m.country,
+    m.completed_calls AS current_completed_calls, m.short_calls AS current_short_calls, m.short_call_rate AS current_short_call_rate,
+    dod.baseline_short_calls AS baseline_dod_short_calls, dod.baseline_value AS baseline_dod_short_call_rate, ROUND((m.short_call_rate - COALESCE(dod.baseline_value, 0)) * 100, 2) AS pp_change_dod,
+    CASE WHEN sad.stddev_value > 0 THEN ROUND((m.short_call_rate - dod.baseline_value) / sad.stddev_value, 2) ELSE NULL END AS z_score_dod,
+    CASE WHEN dod.baseline_value IS NULL OR sad.sample_size < 5 THEN 'INSUFFICIENT_DATA' WHEN (m.short_call_rate - dod.baseline_value) / NULLIF(sad.stddev_value, 0) > 2.5 THEN 'CRITICAL' WHEN (m.short_call_rate - dod.baseline_value) / NULLIF(sad.stddev_value, 0) > 2.0 THEN 'WARNING' ELSE 'FINE' END AS severity_dod,
+    wow.baseline_short_calls AS baseline_wow_short_calls, wow.baseline_value AS baseline_wow_short_call_rate, ROUND((m.short_call_rate - COALESCE(wow.baseline_value, 0)) * 100, 2) AS pp_change_wow,
+    CASE WHEN ssw.stddev_value > 0 THEN ROUND((m.short_call_rate - wow.baseline_value) / ssw.stddev_value, 2) ELSE NULL END AS z_score_wow,
+    CASE WHEN wow.baseline_value IS NULL OR ssw.sample_size < 3 THEN 'INSUFFICIENT_DATA' WHEN (m.short_call_rate - wow.baseline_value) / NULLIF(ssw.stddev_value, 0) > 2.5 THEN 'CRITICAL' WHEN (m.short_call_rate - wow.baseline_value) / NULLIF(ssw.stddev_value, 0) > 2.0 THEN 'WARNING' ELSE 'FINE' END AS severity_wow,
+    ssw.avg_value AS baseline_30d_avg_short_call_rate, ROUND((m.short_call_rate - COALESCE(ssw.avg_value, 0)) * 100, 2) AS pp_change_30d,
+    CASE WHEN ssw.stddev_value > 0 THEN ROUND((m.short_call_rate - ssw.avg_value) / ssw.stddev_value, 2) ELSE NULL END AS z_score_30d,
+    CASE WHEN ssw.avg_value IS NULL OR ssw.sample_size < 3 THEN 'INSUFFICIENT_DATA' WHEN (m.short_call_rate - ssw.avg_value) / NULLIF(ssw.stddev_value, 0) > 2.5 THEN 'CRITICAL' WHEN (m.short_call_rate - ssw.avg_value) / NULLIF(ssw.stddev_value, 0) > 2.0 THEN 'WARNING' ELSE 'FINE' END AS severity_30d
+FROM display_metrics m
+LEFT JOIN baseline_dod dod ON m.organization_code = dod.organization_code AND m.country = dod.country AND m.hour_of_day = dod.hour_of_day AND m.eval_date = dod.eval_date
+LEFT JOIN baseline_wow wow ON m.organization_code = wow.organization_code AND m.country = wow.country AND m.hour_of_day = wow.hour_of_day AND m.eval_date = wow.eval_date
+LEFT JOIN stddev_all_days sad ON m.organization_code = sad.organization_code AND m.country = sad.country AND m.hour_of_day = sad.hour_of_day
+LEFT JOIN stddev_same_weekday ssw ON m.organization_code = ssw.organization_code AND m.country = ssw.country AND m.day_of_week = ssw.day_of_week AND m.hour_of_day = ssw.hour_of_day
+ORDER BY m.eval_hour DESC, m.organization_name, m.country
