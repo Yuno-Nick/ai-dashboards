@@ -1,6 +1,6 @@
 # 💰 Revenue Dashboard
 
-> **Versión:** 1.0  
+> **Versión:** 1.1  
 > **Última actualización:** Enero 2026  
 > **Owner:** Data Engineering Team - AI Squad  
 > **Estado:** ✅ Producción
@@ -93,17 +93,27 @@ ai_revenue_mart (Materialized View)
 ├── Refresh: ASYNC cada 5 minutos
 ├── Granularidad: 1 fila por comunicación (llamada o mensaje WhatsApp)
 └── Fuentes upstream:
-    ├── ai_calls_detail
-    ├── ai_whatsapp_detail
-    └── nova_costs (pricing por organización/país)
+    ├── ai_calls_detail      # Detalle de llamadas
+    ├── ai_messages_detail   # Detalle de WhatsApp
+    └── nova_costs (seed)    # Pricing + reglas de billability
 ```
 
 ### Modelo de Pricing
 
-| Producto | Tipo de Cobro | Ejemplo |
+| Producto | Tipo de Cobro | Fórmula |
 |----------|---------------|---------|
-| **PHONE_CALL** | Por minuto de duración | $0.20/min (Rappi PE) |
-| **WHATSAPP_MESSAGE** | Conversación + Mensajes | $0.07/conv + $0.01/msg |
+| **PHONE_CALL** | Por minuto | `minutes × unit_cost` |
+| **WHATSAPP_MESSAGE** | Conversación + Mensajes | `conversation_cost + (messages × unit_cost)` |
+
+### Billability Configurable por Organización
+
+La tabla `nova_costs` define qué clasificaciones de llamadas son facturables para cada organización:
+
+| Flag | Descripción | Ejemplo |
+|------|-------------|---------|
+| `bill_good_calls` | Cobra por llamadas good_calls | Rappi: ✅ |
+| `bill_short_calls` | Cobra por llamadas short_calls | Rappi: ❌, Intcomex: ✅ |
+| `bill_completed` | Cobra por llamadas completed | Rappi: ❌, Intcomex: ✅ |
 
 ---
 
@@ -115,29 +125,33 @@ Todos los queries soportan los siguientes filtros de Metabase:
 |--------|----------|-------------|
 | Fecha | `{{revenue_date}}` | Rango de fechas (solo en tot_insights) |
 | Organización | `{{organization_name}}` | Filtrar por merchant |
-| País | `{{country}}` | Filtrar por país (AR, BR, PE, MX, CO) |
+| País | `{{country}}` | Filtrar por país (AR, BR, PE, MX, CO, CL) |
 | Producto | `{{product}}` | PHONE_CALL o WHATSAPP_MESSAGE |
 
 ---
 
 ## 📈 Métricas Clave
 
-### Atributos de Revenue
+### Clasificaciones de Llamadas
 
-| Atributo | Tipo | Descripción |
-|----------|------|-------------|
-| `revenue` | DECIMAL | Ingreso en USD |
-| `items` | INTEGER | Número de comunicaciones |
-| `units` | DECIMAL | Unidades facturadas (minutos o mensajes) |
-| `is_billable` | BOOLEAN | Si genera revenue |
+| Clasificación | Descripción | Billable por defecto |
+|---------------|-------------|----------------------|
+| `good_calls` | Llamada completada, transcripción ≥1000 chars, sin voicemail | Configurable |
+| `short_calls` | Llamada completada, transcripción <1000 chars | Configurable |
+| `completed` | Llamada completada sin transcripción válida | Configurable |
+| `voicemail` | Fue a buzón de voz | ❌ No |
+| `failed` | Llamada fallida | ❌ No |
+| `no-answer` | No contestaron | ❌ No |
 
-### Clasificaciones de Billability
+### Organizaciones Activas
 
-| Producto | Clasificación | is_billable |
-|----------|---------------|-------------|
-| PHONE_CALL | good_calls, short_calls, completed | TRUE |
-| PHONE_CALL | failed, voicemail, no_answer | FALSE |
-| WHATSAPP_MESSAGE | (todas) | TRUE |
+| Organización | Países | Productos | Billability |
+|--------------|--------|-----------|-------------|
+| Rappi | AR, BR, PE, CL, CO, MX | PHONE_CALL, WHATSAPP | Solo good_calls |
+| Intcomex | MX | PHONE_CALL | good + short + completed |
+| Viva Aerobus | CO | PHONE_CALL | good + short |
+| ZigFun | BR | WHATSAPP | Todos los mensajes |
+| Peru Rail | PE | WHATSAPP | Solo conversación |
 
 ---
 
@@ -171,6 +185,7 @@ Todos los queries soportan los siguientes filtros de Metabase:
 
 | Versión | Fecha | Cambios |
 |---------|-------|---------|
+| 1.1 | Enero 2026 | Actualización con billability configurable por organización, nuevo modelo ai_messages_detail |
 | 1.0 | Enero 2026 | Release inicial con 17 queries organizadas en 2 tabs |
 
 ---
