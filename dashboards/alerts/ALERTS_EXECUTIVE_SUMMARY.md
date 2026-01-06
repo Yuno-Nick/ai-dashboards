@@ -648,7 +648,7 @@ Cuando recibas una alerta, sigue estos pasos:
 
 **Última actualización:** Diciembre 2025  
 **Versión:** 1.0 Executive Summary  
-**Contacto:** Data Engineering Team
+**Contacto:** AI Data Team - AI Squad
 
 Para documentación técnica detallada, consulta: `ALERTS_DOCUMENTATION.md`
 

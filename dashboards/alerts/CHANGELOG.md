@@ -237,5 +237,5 @@ Historial de cambios específico del dashboard de alertas.
 
 **Última actualización:** 2025-12-22  
 **Versión actual:** 1.0.0  
-**Mantenido por:** Data Engineering Team
+**Mantenido por:** AI Data Team - AI Squad
 

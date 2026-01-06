@@ -549,5 +549,5 @@ changes
 
 **Última actualización:** Diciembre 2025  
 **Versión:** 1.0  
-**Mantenido por:** Data Engineering Team
+**Mantenido por:** AI Data Team - AI Squad
 

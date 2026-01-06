@@ -57,7 +57,7 @@ dashboards/
 |----------|-------|
 | **Estado** | Producción |
 | **Última actualización** | Diciembre 2025 |
-| **Owner** | Data Engineering Team |
+| **Owner** | AI Data Team - AI Squad |
 
 **Documentación:**
 - [README](./alerts/README.md) — Índice y guía rápida
@@ -79,7 +79,7 @@ dashboards/
 |----------|-------|
 | **Estado** | Producción |
 | **Última actualización** | Enero 2026 |
-| **Owner** | Data Engineering Team |
+| **Owner** | AI Data Team - AI Squad |
 
 **Documentación:**
 - [README](./revenue/README.md) — Índice y guía rápida
@@ -139,12 +139,12 @@ Una vez completados, estos dashboards serán agregados al repositorio siguiendo 
 
 | Dashboard | Owner | Estado | Última Revisión |
 |-----------|-------|--------|-----------------|
-| Alerts | Data Engineering Team | ✅ Completo | Dic 2025 |
-| Revenue | Data Engineering Team | ✅ Completo | Ene 2026 |
-| Calls | Data Engineering Team | 🔨 En desarrollo | — |
-| WhatsApp | Data Engineering Team | 🔨 En desarrollo | — |
-| Aida | Data Engineering Team | 📋 Planificado | — |
-| Roberto | Data Engineering Team | 📋 Planificado | — |
+| Alerts | AI Data Team - AI Squad | ✅ Completo | Dic 2025 |
+| Revenue | AI Data Team - AI Squad | ✅ Completo | Ene 2026 |
+| Calls | AI Data Team - AI Squad | 🔨 En desarrollo | — |
+| WhatsApp | AI Data Team - AI Squad | 🔨 En desarrollo | — |
+| Aida | AI Data Team - AI Squad | 📋 Planificado | — |
+| Roberto | AI Data Team - AI Squad | 📋 Planificado | — |
 
 **Responsabilidades del Owner:**
 - ✅ Mantener documentación actualizada
@@ -184,4 +184,4 @@ Una vez completados, estos dashboards serán agregados al repositorio siguiendo 
 
 **Última actualización:** Enero 2026  
 **Versión:** 1.1  
-**Mantenido por:** Data Engineering Team — AI Squad
+**Mantenido por:** AI Data Team - AI Squad
