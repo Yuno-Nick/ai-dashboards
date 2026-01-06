@@ -127,5 +127,5 @@ Ver [alerts/CHANGELOG.md](./alerts/CHANGELOG.md) para historial completo del das
 ---
 
 **Última actualización:** 2025-12-22  
-**Mantenido por:** Data Engineering Team
+**Mantenido por:** AI Data Team - AI Squad
 
